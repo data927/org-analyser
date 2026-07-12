@@ -517,20 +517,18 @@ def scan_secrets_and_pii(content, path):
     """Secrets (masked) + email count for one file. Returns (secrets, emails)."""
     secrets = []
     for name, pat in SECRET_PATTERNS:
-        m = re.search(pat, content)
-        if not m:
-            continue
-        val = m.group(0)
-        if name == "Hardcoded secret":
-            # skip placeholder values / env lookups
-            line_start = content.rfind("\n", 0, m.start()) + 1
-            line_end = content.find("\n", m.end())
-            if line_end == -1:
-                line_end = len(content)
-            if _PLACEHOLDER_RE.search(content[line_start:line_end]):
-                continue
-        secrets.append({"type": name, "file": path,
-                        "masked": _mask_secret(val)})
+        for m in re.finditer(pat, content):
+            val = m.group(0)
+            if name == "Hardcoded secret":
+                # skip placeholder values / env lookups
+                line_start = content.rfind("\n", 0, m.start()) + 1
+                line_end = content.find("\n", m.end())
+                if line_end == -1:
+                    line_end = len(content)
+                if _PLACEHOLDER_RE.search(content[line_start:line_end]):
+                    continue
+            secrets.append({"type": name, "file": path,
+                            "masked": _mask_secret(val)})
     emails = 0
     for m in EMAIL_RE.finditer(content):
         if not _EMAIL_IGNORE_RE.search(m.group(0)):

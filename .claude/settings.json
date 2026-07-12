@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3)",
+      "Bash(git -C /Users/rohit/Desktop/org-analyser diff HEAD repo-quality-score/scripts/repo_stats.py)",
+      "Bash(awk -F'https?://' '{print $2}')",
+      "Bash(awk '/def _smart_sample_security/,/^def [a-z_]+\\\\\\(.*\\\\\\)/{print NR\": \"$0}' repo-eval-kit/security_check.py)",
+      "Bash(awk '/def _extract_flagged_paths/,/^def /{print NR\": \"$0}' repo-eval-kit/security_check.py)",
+      "Bash(awk '/def _snippet_for_file/,/^def [a-z_]/{print NR\": \"$0}' repo-eval-kit/security_check.py)",
+      "Bash(git help *)",
+      "Bash(env -i git help environment)",
+      "Bash(GIT_HTTP_EXTRAHEADER=\"AUTHORIZATION: basic SENTINELVALUE\" GIT_TRACE_CURL=1 git ls-remote https://github.com/octocat/Hello-World.git)",
+      "Bash(xargs -I{} echo \"auth-header lines seen in outbound request: {}\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('security_check.py'\\).read\\(\\)\\); print\\('security_check.py parses OK'\\)\")"
+    ],
+    "additionalDirectories": [
+      "/Users/rohit"
+    ]
+  }
+}

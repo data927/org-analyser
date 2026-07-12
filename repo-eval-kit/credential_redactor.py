@@ -111,31 +111,6 @@ def redact_diff(diff_text: str) -> tuple[str, dict]:
     return redacted_diff, stats
 
 
-def should_redact_for_llm(repo_name: str, explicit_allow: Optional[list] = None) -> bool:
-    """
-    Check if this repository should have secrets redacted before LLM analysis.
-
-    Args:
-        repo_name: Repository name/path
-        explicit_allow: List of repo names that can share secrets (e.g., test repos)
-
-    Returns:
-        True if secrets should be redacted (default), False if allowed to send
-
-    Most repos should have redaction enabled. Only explicitly allow
-    test/demo repositories that contain no real credentials.
-    """
-    if explicit_allow is None:
-        explicit_allow = []
-
-    # Never redact for these test repos
-    for allowed in explicit_allow:
-        if allowed.lower() in repo_name.lower():
-            return False
-
-    # Redact for everything else
-    return True
-
 
 # Logging/reporting functions for transparency
 

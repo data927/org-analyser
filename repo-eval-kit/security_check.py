@@ -13,6 +13,11 @@ from pathlib import Path
 import click
 from dotenv import load_dotenv
 
+try:
+    from .credential_redactor import redact_secrets
+except ImportError:  # invoked as a top-level script (cwd=repo-eval-kit)
+    from credential_redactor import redact_secrets
+
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 
 DEFAULT_MODEL = "gpt-5.1"
@@ -1341,6 +1346,10 @@ def _check_repo(
             root, source_files, all_details, sample_tokens
         )
         if code_samples:
+            # Strip live credentials from source before it leaves for the LLM.
+            code_samples, _redactions = redact_secrets(code_samples)
+            if _redactions and verbose_log:
+                verbose_log(f"    Redacted before LLM: {_redactions}")
             # Pass automated findings grouped by category for LLM context
             automated_grouped = {
                 "secrets": d1,
