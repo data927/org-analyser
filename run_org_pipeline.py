@@ -567,16 +567,14 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
 
 def clone_url(entry: RepoEntry, tokens: dict[str, str], ctx: RunContext) -> str:
     if entry.platform == "github":
-        token = tokens[ctx.github_token_name]
         host = ctx.github_host
         if host == "github.com":
-            return f"https://x-access-token:{token}@github.com/{entry.full_name}.git"
-        return f"https://x-access-token:{token}@{host}/{entry.full_name}.git"
-    token = tokens[GITLAB_TOKEN_NAME]
+            return f"https://github.com/{entry.full_name}.git"
+        return f"https://{host}/{entry.full_name}.git"
     host = ctx.gitlab_host.rstrip("/")
     if not host.startswith("http"):
         host = f"https://{host}"
-    return f"https://oauth2:{token}@{host.replace('https://', '')}/{entry.full_name}.git"
+    return f"{host}/{entry.full_name}.git"
 
 
 def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | None]:
@@ -589,13 +587,30 @@ def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | No
     if ctx.clone_depth:
         cmd.extend(["--depth", str(ctx.clone_depth)])
     cmd.extend([clone_url(entry, ctx.tokens, ctx), str(dest)])
+
     env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+    # Pass token via environment variable instead of embedding in URL
+    if entry.platform == "github":
+        token = ctx.tokens.get(ctx.github_token_name, "")
+        if token:
+            env["GIT_ASKPASS_OVERRIDE"] = token
+            env["GIT_HTTP_EXTRAHEADER"] = f"AUTHORIZATION: basic {__import__('base64').b64encode((f':{token}').encode()).decode()}"
+    elif entry.platform == "gitlab":
+        token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
+        if token:
+            env["GIT_ASKPASS_OVERRIDE"] = token
+            env["GIT_HTTP_EXTRAHEADER"] = f"PRIVATE-TOKEN: {token}"
+
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env=env)
     except subprocess.TimeoutExpired:
         return False, "clone timeout", None
     if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout or "")[-800:], None
+        err_msg = (proc.stderr or proc.stdout or "")[-800:]
+        # Sanitize error message to remove any accidentally exposed tokens
+        err_msg = err_msg.replace(ctx.tokens.get(ctx.github_token_name, ""), "[REDACTED]")
+        err_msg = err_msg.replace(ctx.tokens.get(GITLAB_TOKEN_NAME, ""), "[REDACTED]")
+        return False, err_msg, None
 
     verify = subprocess.run(
         ["git", *git_longpath_config(), "-C", str(dest), "rev-parse", "HEAD"],

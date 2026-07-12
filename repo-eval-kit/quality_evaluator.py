@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from .credential_redactor import redact_diff, redaction_summary
+
 logger = logging.getLogger(__name__)
 
 
@@ -506,6 +508,16 @@ class QualityEvaluator:
         inferred_statement = None
         inference_confidence = None
 
+        # Redact credentials before sending to LLM
+        src_diff_for_llm, src_stats = redact_diff(src_diff)
+        test_diff_for_llm, test_stats = redact_diff(test_diff)
+        if src_stats.get("redacted") or test_stats.get("redacted"):
+            logger.info(
+                "Redacted secrets from diffs before LLM analysis - src: %s, test: %s",
+                redaction_summary(src_stats.get("secrets_by_type", {}).items()),
+                redaction_summary(test_stats.get("secrets_by_type", {}).items()),
+            )
+
         if not problem_statement or not problem_statement.strip():
             logger.info("No problem statement provided, inferring from diff...")
             inferred = self._infer_problem_statement(
@@ -531,12 +543,12 @@ class QualityEvaluator:
             problem_statement = problem_statement
 
         # If there are no tests, avoid asking the model to score test-related rubrics.
-        no_tests = (not test_diff) or (not test_diff.strip())
+        no_tests = (not test_diff_for_llm) or (not test_diff_for_llm.strip())
         if no_tests:
-            scores = self._evaluate_quality_no_tests(problem_statement, hints, src_diff)
+            scores = self._evaluate_quality_no_tests(problem_statement, hints, src_diff_for_llm)
         else:
             scores = self._evaluate_quality(
-                problem_statement, hints, src_diff, test_diff
+                problem_statement, hints, src_diff_for_llm, test_diff_for_llm
             )
         if not scores:
             self.last_rejection_reason = "LLM evaluation failed to return scores"
@@ -715,7 +727,10 @@ class QualityEvaluator:
         try:
             response = requests.post(
                 f"{url}?key={self.api_key}",
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": self.api_key,
+                },
                 json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
                 timeout=120,
             )

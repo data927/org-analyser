@@ -510,7 +510,7 @@ _FUNC_DEF_RE = re.compile(
 
 def _mask_secret(v):
     """Secrets are never reported in plain text — masked version."""
-    return (v[:4] + "…" + v[-2:]) if len(v) > 10 else "****"
+    return "[REDACTED]"
 
 
 def scan_secrets_and_pii(content, path):

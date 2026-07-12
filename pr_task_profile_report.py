@@ -374,7 +374,7 @@ def github_graphql(
             continue
 
         if response.status_code >= 400:
-            raise RuntimeError(f"GitHub API error: {response.status_code} {response.text}")
+            raise RuntimeError(f"GitHub API error: {response.status_code}")
 
         payload = response.json()
         if "errors" in payload:
@@ -513,7 +513,7 @@ def gitlab_rest_get(
         if response.status_code == 404:
             raise RuntimeError(f"GitLab REST 404 (not found or no access): {url}")
         if response.status_code >= 400:
-            raise RuntimeError(f"GitLab REST error: {response.status_code} {response.text[:300]}")
+            raise RuntimeError(f"GitLab REST error: {response.status_code}")
         if response.status_code == 204 or not response.text:
             return None
         return response.json()
@@ -804,7 +804,7 @@ def github_rest_get(
         if response.status_code == 404:
             raise RuntimeError(f"GitHub REST 404 (not found or no access): {url}")
         if response.status_code >= 400:
-            raise RuntimeError(f"GitHub REST error: {response.status_code} {response.text}")
+            raise RuntimeError(f"GitHub REST error: {response.status_code}")
 
         return response.json()
 
