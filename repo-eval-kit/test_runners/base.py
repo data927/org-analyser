@@ -188,24 +188,12 @@ class TestRunner(ABC):
         """
         pass
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return install command for logging/debugging."""
-        return []
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command for logging/debugging."""
-        return []
-
     def check_runtime(self) -> Tuple[bool, str]:
         """
         Check if the required runtime is available.
         Returns (available, version_string or error_message).
         """
         return True, "unknown"
-
-    def get_install_instructions(self) -> str:
-        """Return instructions for installing the required runtime."""
-        return f"Please install {self.language} runtime."
 
     def get_required_version(self, repo_path: Path) -> Optional[str]:
         """Return required runtime version from repo config, or None if not specified."""

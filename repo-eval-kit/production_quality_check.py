@@ -35,7 +35,6 @@ Usage:
 
 import csv
 import hashlib
-import io
 import json
 import os
 import re
@@ -45,7 +44,6 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-import click
 from dotenv import load_dotenv
 
 try:

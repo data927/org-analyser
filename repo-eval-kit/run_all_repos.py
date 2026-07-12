@@ -94,33 +94,6 @@ def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
-def _env_bool(key: str, default: bool = False) -> bool:
-    """Read an env var as boolean (true/1/yes → True)."""
-    val = os.getenv(key, "")
-    if not val:
-        return default
-    return val.strip().lower() in ("true", "1", "yes")
-
-
-def _env_int(key: str, default: int) -> int:
-    """Read an env var as int."""
-    val = os.getenv(key, "")
-    if not val:
-        return default
-    try:
-        return int(val)
-    except ValueError:
-        return default
-
-
-def _env_list(key: str) -> List[str]:
-    """Read a comma-separated env var as a list of strings."""
-    val = os.getenv(key, "")
-    if not val.strip():
-        return []
-    return [item.strip() for item in val.split(",") if item.strip()]
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # GitHub API helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -368,12 +341,6 @@ class GitLabAPI:
             params={"include_subgroups": "true", "with_shared": "false"}
         )
 
-    def list_user_projects(self) -> List[dict]:
-        """Return projects the user owns or is a member of."""
-        return self._paginate(
-            f"{self.api_base}/projects",
-            params={"membership": "true", "owned": "false"}
-        )
 
     def list_owned_projects(self) -> List[dict]:
         """Return projects the user owns."""
@@ -1684,20 +1651,4 @@ def _finish(cfg: ResolvedConfig, org_repos: Dict[str, List[RepoInfo]]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 

@@ -83,13 +83,6 @@ class CMakeRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return install command."""
-        return ["cmake", "-B", "build", "&&", "cmake", "--build", "build"]
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        return ["ctest", "--test-dir", "build", "--output-on-failure"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run CTest and return results."""
@@ -243,9 +236,6 @@ class MakeRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        return ["make", "test"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run make test and return results."""
@@ -344,9 +334,6 @@ class GoogleTestRunner(TestRunner):
         cmake_runner = CMakeRunner()
         return cmake_runner.install_deps(repo_path, timeout)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        return ["ctest", "--test-dir", "build", "--output-on-failure"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run GoogleTest via CTest."""

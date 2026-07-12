@@ -71,7 +71,6 @@ try:
         MIN_TEST_FILES,
         OPEN_SOURCE_HINT_FILES,
         OPEN_SOURCE_KEYWORDS,
-        REPO_HEALTH_DESCRIPTIONS,
         REPO_HEALTH_THRESHOLDS,
     )
     from .repo_evaluator_helpers import (
@@ -107,7 +106,6 @@ except Exception:
         MIN_TEST_FILES,
         OPEN_SOURCE_HINT_FILES,
         OPEN_SOURCE_KEYWORDS,
-        REPO_HEALTH_DESCRIPTIONS,
         REPO_HEALTH_THRESHOLDS,
     )
     from repo_evaluator_helpers import (

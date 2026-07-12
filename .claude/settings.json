@@ -11,7 +11,20 @@
       "Bash(env -i git help environment)",
       "Bash(GIT_HTTP_EXTRAHEADER=\"AUTHORIZATION: basic SENTINELVALUE\" GIT_TRACE_CURL=1 git ls-remote https://github.com/octocat/Hello-World.git)",
       "Bash(xargs -I{} echo \"auth-header lines seen in outbound request: {}\")",
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('security_check.py'\\).read\\(\\)\\); print\\('security_check.py parses OK'\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('security_check.py'\\).read\\(\\)\\); print\\('security_check.py parses OK'\\)\")",
+      "Bash(pip install *)",
+      "Bash(vulture . --min-confidence 60 --exclude '.venv,outputs,__pycache__,*/test_*,test_*')",
+      "Bash(python3 -m pip install vulture -q)",
+      "Bash(python3 -m vulture . --min-confidence 70 --exclude '.venv,outputs,__pycache__')",
+      "Bash(python3 -m venv /tmp/auditvenv)",
+      "Bash(/tmp/auditvenv/bin/pip install *)",
+      "Bash(/tmp/auditvenv/bin/vulture . --min-confidence 70 --exclude '.venv,outputs,__pycache__')",
+      "Bash(/tmp/auditvenv/bin/vulture . --min-confidence 80 --exclude '.venv,outputs,__pycache__')",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(/tmp/auditvenv/bin/vulture repo_analyzer.py run_org_pipeline.py pr_task_profile_report.py count_merged_prs.py export_all_merged_prs.py repo-eval-kit codebase_profiler repo-quality-score --min-confidence 60)",
+      "Bash(python3 /private/tmp/claude-501/-Users-rohit-Desktop-org-analyser/791ddd0d-b4ad-4696-bc69-659e42534469/scratchpad/dead_remove.py)",
+      "Bash(/tmp/auditvenv/bin/vulture repo-eval-kit/taxonomy_check.py repo-eval-kit/quality_evaluator.py repo-eval-kit/run_all_repos.py repo-eval-kit/repo_evaluator_helpers.py repo-eval-kit/platform_clients.py repo-eval-kit/cybersecurity_pr_scanner.py repo-eval-kit/test_runners/ export_all_merged_prs.py run_org_pipeline.py --min-confidence 90)",
+      "Bash(xargs ls -la)"
     ],
     "additionalDirectories": [
       "/Users/rohit"

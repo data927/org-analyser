@@ -109,15 +109,6 @@ class PHPUnitRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        project_root = _find_php_project_root(repo_path)
-        if (project_root / "vendor" / "bin" / "phpunit").exists():
-            return ["php", "vendor/bin/phpunit", "--colors=never"]
-        if (project_root / "vendor" / "bin" / "simple-phpunit").exists():
-            return ["php", "vendor/bin/simple-phpunit", "--colors=never"]
-        if self._check_command_exists("composer") and (project_root / "composer.json").exists():
-            return ["composer", "test", "--", "--colors=never"]
-        return ["phpunit", "--colors=never"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         project_root = _find_php_project_root(repo_path)
@@ -212,11 +203,6 @@ class PestRunner(PHPUnitRunner):
                 score += 20
         return min(score, 100)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        project_root = _find_php_project_root(repo_path)
-        if (project_root / "vendor" / "bin" / "pest").exists():
-            return ["php", "vendor/bin/pest", "--colors=never"]
-        return ["pest", "--colors=never"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         project_root = _find_php_project_root(repo_path)

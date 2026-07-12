@@ -5,7 +5,10 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from .credential_redactor import redact_diff, redaction_summary
+try:
+    from .credential_redactor import redact_diff, redaction_summary
+except ImportError:  # invoked as a top-level script (cwd=repo-eval-kit)
+    from credential_redactor import redact_diff, redaction_summary
 
 logger = logging.getLogger(__name__)
 
@@ -60,69 +63,6 @@ class QualityScores:
             + self.test_to_issue_alignment
         )
 
-    def get_recommendation(self) -> str:
-        total = self.total_score()
-        if total <= 5:
-            return "strong_candidate"
-        elif total <= 10:
-            return "borderline"
-        return "reject"
-
-    def to_summary_dict(self) -> dict:
-        return {
-            "recommendation": self.get_recommendation(),
-            "total_score": self.total_score(),
-            "max_possible_score": 21,
-            "dimensions": {
-                "issue_clarity": {
-                    "score": self.issue_clarity,
-                    "max": 3,
-                    "label": self.issue_clarity_label,
-                    "rationale": self.issue_clarity_rationale,
-                },
-                "test_to_issue_alignment": {
-                    "score": self.test_to_issue_alignment,
-                    "max": 3,
-                    "label": self.test_to_issue_alignment_label,
-                    "rationale": self.test_to_issue_alignment_rationale,
-                },
-                "gold_patch_clarity": {
-                    "score": self.gold_patch_clarity,
-                    "max": 3,
-                    "rationale": self.clarity_rationale,
-                },
-                "patch_to_issue_alignment": {
-                    "score": self.patch_to_issue_alignment,
-                    "max": 3,
-                    "rationale": self.alignment_rationale,
-                },
-                "test_clarity": {
-                    "score": self.test_clarity,
-                    "max": 3,
-                    "rationale": self.test_rationale,
-                },
-                "false_negative": {
-                    "score": self.fn_score,
-                    "max": 3,
-                    "label": self.fn_label,
-                    "rationale": self.fn_rationale,
-                },
-                "false_positive": {
-                    "score": self.fp_score,
-                    "max": 3,
-                    "label": self.fp_label,
-                    "rationale": self.fp_rationale,
-                },
-                "task_difficulty": {
-                    "score": self.task_difficulty,
-                    "max": 3,
-                    "label": self.task_difficulty_label,
-                    "rationale": self.task_difficulty_rationale,
-                },
-            },
-            "inferred_problem": self.inferred_problem_statement,
-            "inference_confidence": self.inference_confidence,
-        }
 
     def to_trimmed_rubrics_dict(self) -> dict:
         """Trimmed benchmark rubrics: score + reasoning (labels where applicable)."""
@@ -450,50 +390,6 @@ class QualityEvaluator:
             return os.environ.get("OPENAI_API_KEY", "")
         return ""
 
-    def check_f2p_p2p(
-        self, src_diff: str, test_diff: str
-    ) -> Tuple[bool, str, Optional[dict]]:
-        if not test_diff or not test_diff.strip():
-            return False, "No test changes found", None
-
-        prompt = F2P_P2P_CHECK_PROMPT.format(
-            src_diff=self._truncate_diff(src_diff, self.max_diff_lines // 2)
-            or "(No source changes)",
-            test_diff=self._truncate_diff(test_diff, self.max_diff_lines // 2),
-        )
-
-        data = self._parse_json_response(self._call_llm(prompt))
-        if not data:
-            return False, "Failed to analyze F2P/P2P tests", None
-
-        f2p_evidence = data.get("f2p_evidence", "")
-        p2p_evidence = data.get("p2p_evidence", "")
-        estimated_f2p = data.get("estimated_f2p_tests", 0)
-        estimated_p2p = data.get("estimated_p2p_tests", 0)
-
-        # Cross-validate: override boolean if estimated count is 0
-        has_f2p = data.get("has_f2p", False) and estimated_f2p > 0
-        has_p2p = data.get("has_p2p", False) and estimated_p2p > 0
-
-        stats = {
-            "estimated_f2p_tests": estimated_f2p,
-            "estimated_p2p_tests": estimated_p2p,
-            "f2p_evidence": f2p_evidence,
-            "p2p_evidence": p2p_evidence,
-        }
-
-        if not has_f2p and not has_p2p:
-            return (
-                False,
-                f"No F2P or P2P tests detected. F2P: {f2p_evidence}, P2P: {p2p_evidence}",
-                None,
-            )
-        if not has_f2p:
-            return False, f"No F2P tests detected: {f2p_evidence}", None
-        if not has_p2p:
-            return False, f"No P2P tests detected: {p2p_evidence}", None
-
-        return True, "", stats
 
     def evaluate_candidate(
         self,

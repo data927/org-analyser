@@ -195,17 +195,6 @@ class PytestRunner(TestRunner):
 
         return False, "; ".join(errors)
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return typical install command."""
-        python_cmd = sys.executable
-        if (repo_path / "pyproject.toml").exists() or (repo_path / "setup.py").exists():
-            return [python_cmd, "-m", "pip", "install", "-e", ".[dev,test]"]
-        return [python_cmd, "-m", "pip", "install", "-r", "requirements.txt"]
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        python_cmd = sys.executable
-        return [python_cmd, "-m", "pytest", "-v", "--tb=short"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run pytest and return results."""
@@ -363,15 +352,6 @@ class UnittestRunner(TestRunner):
 
         return len(errors) == 0, "; ".join(errors)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        python_cmd = sys.executable
-        if (repo_path / "manage.py").exists():
-            return [python_cmd, "manage.py", "test"]
-        standalone = self._find_standalone_tests(repo_path)
-        if standalone:
-            return [python_cmd, str(standalone[0])]
-        return [python_cmd, "-m", "unittest", "discover", "-v"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run unittest and return results."""

@@ -97,13 +97,6 @@ class GoTestRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return install command."""
-        return ["go", "mod", "download"]
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        return ["go", "test", "-json", "./..."]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run go test and return results."""

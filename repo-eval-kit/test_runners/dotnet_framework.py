@@ -207,15 +207,6 @@ class DotNetFrameworkRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return install command."""
-        msbuild = self._find_msbuild() or "msbuild"
-        return [msbuild, "/t:Restore"]
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        vstest = self._find_vstest() or "vstest.console.exe"
-        return [vstest, "**/*.Tests.dll"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run tests using vstest.console.exe."""

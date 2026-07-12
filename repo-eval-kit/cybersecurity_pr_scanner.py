@@ -243,11 +243,6 @@ class GitHubClient:
                 resp = self.session.request(method, url, timeout=120, **kw)
         return resp
 
-    def get_json(self, path: str, params: Optional[dict] = None) -> Any:
-        url = path if path.startswith("http") else f"{GITHUB_API}{path}"
-        r = self._request("GET", url, params=params or {})
-        r.raise_for_status()
-        return r.json()
 
     def paginate(self, path: str, params: Optional[dict] = None) -> List[dict]:
         out: List[dict] = []

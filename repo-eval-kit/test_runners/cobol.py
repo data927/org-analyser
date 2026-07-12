@@ -194,11 +194,6 @@ class CobolCheckRunner(TestRunner):
 
         return True, ""
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        jar = _find_cobol_check_jar(repo_path)
-        if jar is None:
-            return ["cobol-check"]
-        return ["java", "-jar", str(jar)]
 
     def _discover_programs(self, repo_path: Path) -> List[str]:
         """Discover COBOL programs that have test suites."""

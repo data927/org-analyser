@@ -12,7 +12,7 @@ from .base import (
     TestRunner, TestResult, RuntimeNotFoundError,
     DependencyInstallError, TestTimeoutError
 )
-from .parsers import parse_jest_json, parse_jest_verbose_output, parse_vitest_json, parse_mocha_json
+from .parsers import parse_jest_json, parse_jest_verbose_output, parse_mocha_json
 
 
 def _load_test_env(project_root: Path) -> dict:
@@ -291,15 +291,6 @@ class JestRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return install command."""
-        _, install_cmd, _ = self._get_pm_commands(repo_path)
-        return install_cmd
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        _, _, run_cmd = self._get_pm_commands(repo_path)
-        return run_cmd + ["jest", "--json"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run Jest and return results."""
@@ -596,10 +587,6 @@ class VitestRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        _, _, run_cmd = self._get_pm_commands(repo_path)
-        return run_cmd + ["vitest", "run", "--reporter=json"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run Vitest and return results."""
@@ -766,10 +753,6 @@ class MochaRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        _, _, run_cmd = self._get_pm_commands(repo_path)
-        return run_cmd + ["mocha", "--reporter", "json"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run Mocha and return results."""
@@ -954,10 +937,6 @@ class NodeTestRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        _, _, run_cmd = self._get_pm_commands(repo_path)
-        return run_cmd + ["test"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run node --test via npm test and return results."""

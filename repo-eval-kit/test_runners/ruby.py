@@ -120,13 +120,6 @@ class RSpecRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return install command."""
-        return ["bundle", "install"]
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        return ["bundle", "exec", "rspec", "--format", "json"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run RSpec and return results."""
@@ -285,9 +278,6 @@ class MinitestRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        return ["bundle", "exec", "rake", "test"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run Minitest and return results."""

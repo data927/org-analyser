@@ -83,14 +83,6 @@ def _get_affected_packages(changed_files: List[str], repo_path: Path) -> List[Pa
     return sorted(packages)
 
 
-def _test_passed(test: str, status_map: Dict[str, str]) -> bool:
-    return test in status_map and status_map[test] in PASSED_STATUSES
-
-
-def _test_failed(test: str, status_map: Dict[str, str]) -> bool:
-    return test not in status_map or status_map[test] in FAILED_STATUSES
-
-
 def generate_test_report(
     tests_base: Dict[str, str],
     tests_before: Dict[str, str],
@@ -166,17 +158,6 @@ def generate_test_report(
                 result["FAIL_TO_FAIL"].append(test)
 
     return result
-
-
-def _result_to_status_map(result: TestResult) -> Dict[str, str]:
-    status_map = {}
-    for t in result.passed:
-        status_map[t] = "PASSED"
-    for t in result.failed:
-        status_map[t] = "FAILED"
-    for t in result.skipped:
-        status_map[t] = "SKIPPED"
-    return status_map
 
 
 UNSTABLE_PATTERNS = [

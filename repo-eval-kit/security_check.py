@@ -1,5 +1,4 @@
 import csv
-import io
 import json
 import os
 import re
@@ -10,7 +9,6 @@ import tempfile
 from collections import defaultdict
 from pathlib import Path
 
-import click
 from dotenv import load_dotenv
 
 try:

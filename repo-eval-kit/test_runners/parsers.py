@@ -427,15 +427,6 @@ def parse_dotnet_trx(trx_path: Path) -> TestResult:
     )
 
 
-def parse_vitest_json(json_path: Path) -> TestResult:
-    """
-    Parse Vitest JSON output format.
-    Similar to Jest but may have slight differences.
-    """
-    # Vitest JSON format is similar to Jest
-    return parse_jest_json(json_path)
-
-
 def parse_mocha_json(json_path: Path) -> TestResult:
     """
     Parse Mocha JSON output format.

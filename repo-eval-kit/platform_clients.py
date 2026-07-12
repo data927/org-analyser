@@ -164,9 +164,6 @@ class PlatformClient(ABC):
     def fetch_issue(self, issue_number: int) -> Optional[dict]:
         pass
 
-    @abstractmethod
-    def get_repo_url(self, include_token: bool = False) -> str:
-        pass
 
     @abstractmethod
     def extract_issue_number_from_text(self, text: str) -> List[int]:
@@ -328,10 +325,6 @@ class GitHubClient(PlatformClient):
         closed_count = repo.get("closed", {}).get("totalCount", 0)
         return {"open": open_count, "closed": closed_count, "total": open_count + closed_count}
 
-    def get_repo_url(self, include_token: bool = False) -> str:
-        if include_token and self.token:
-            return f"https://{self.token}@github.com/{self.repo_full_name}.git"
-        return f"https://github.com/{self.repo_full_name}.git"
 
     def extract_issue_number_from_text(self, text: str) -> List[int]:
         if not text:
@@ -527,10 +520,6 @@ class BitbucketClient(PlatformClient):
         except Exception:
             return None
 
-    def get_repo_url(self, include_token: bool = False) -> str:
-        if include_token and self.token:
-            return f"https://x-token-auth:{self.token}@bitbucket.org/{self.repo_full_name}.git"
-        return f"https://bitbucket.org/{self.repo_full_name}.git"
 
     def extract_issue_number_from_text(self, text: str) -> List[int]:
         if not text:
@@ -771,11 +760,6 @@ class GitLabClient(PlatformClient):
         except Exception:
             return None
 
-    def get_repo_url(self, include_token: bool = False) -> str:
-        host = self.base_url.replace("https://", "").replace("http://", "")
-        if include_token and self.token:
-            return f"https://oauth2:{self.token}@{host}/{self.repo_full_name}.git"
-        return f"{self.base_url}/{self.repo_full_name}.git"
 
     def extract_issue_number_from_text(self, text: str) -> List[int]:
         if not text:
@@ -920,8 +904,6 @@ class SvnClient(PlatformClient):
     def fetch_issue(self, issue_number: int) -> Optional[dict]:
         return None
 
-    def get_repo_url(self, include_token: bool = False) -> str:
-        return self.svn_url
 
     def extract_issue_number_from_text(self, text: str) -> List[int]:
         if not text:
@@ -969,8 +951,6 @@ class LocalClient(PlatformClient):
     def fetch_issue(self, issue_number: int) -> Optional[dict]:
         return None
 
-    def get_repo_url(self, include_token: bool = False) -> str:
-        return self.repo_path
 
     def extract_issue_number_from_text(self, text: str) -> List[int]:
         if not text:

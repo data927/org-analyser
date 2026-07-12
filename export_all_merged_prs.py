@@ -14,7 +14,6 @@ import argparse
 import csv
 import re
 import sys
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -67,20 +66,6 @@ def list_github_orgs(token: str, host: str = "github.com") -> list[str]:
             orgs.add(owner["login"])
 
     return sorted(orgs)
-
-
-def list_github_users(token: str, host: str = "github.com") -> list[str]:
-    api = github_api(token, host)
-    users: set[str] = set()
-    repos = paginate_github(
-        f"{api}/user/repos?affiliation=owner,collaborator,organization_member&per_page=100",
-        token,
-    )
-    for repo in repos:
-        owner = repo.get("owner") or {}
-        if owner.get("type") == "User":
-            users.add(owner["login"])
-    return sorted(users)
 
 
 def list_gitlab_top_level_groups(token: str, host: str = "gitlab.com") -> list[str]:

@@ -662,20 +662,6 @@ def stdout_json(stdout: str) -> str:
     return stdout
 
 
-def run_py_message(
-    script: Path,
-    args: list[str],
-    timeout: int = 900,
-    cwd: Path | None = None,
-) -> tuple[int, str]:
-    """Like run_py but merges stdout/stderr for error reporting."""
-    code, out, err = run_py(script, args, timeout=timeout, cwd=cwd)
-    if code == 0 and out.lstrip().startswith("{"):
-        out = stdout_json(out)
-    combined = out + (f"\n{err}" if err else "")
-    return code, combined
-
-
 def with_retries(
     fn: Callable[[], tuple[bool, str]],
     retries: int,

@@ -132,15 +132,6 @@ class MavenRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return install command."""
-        mvn = self._get_mvn_cmd(repo_path)
-        return [mvn, "dependency:resolve"]
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        mvn = self._get_mvn_cmd(repo_path)
-        return [mvn, "test"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run Maven tests and return results."""
@@ -324,15 +315,6 @@ class GradleRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_install_command(self, repo_path: Path) -> List[str]:
-        """Return install command."""
-        gradle = self._get_gradle_cmd(repo_path)
-        return [gradle, "dependencies"]
-
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        gradle = self._get_gradle_cmd(repo_path)
-        return [gradle, "test"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run Gradle tests and return results."""
@@ -492,9 +474,6 @@ class SbtRunner(TestRunner):
         except Exception as e:
             return False, str(e)
 
-    def get_test_command(self, repo_path: Path) -> List[str]:
-        """Return test command."""
-        return ["sbt", "test"]
 
     def run_tests(self, repo_path: Path, timeout: int = 600) -> TestResult:
         """Run sbt tests and return results."""

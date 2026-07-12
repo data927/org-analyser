@@ -372,23 +372,6 @@ def walk_source_files(root: Path) -> list[tuple[Path, str]]:
     return results
 
 
-def grep_in_file(path: Path, patterns: list[re.Pattern]) -> list[str]:
-    """Return lines matching any of the patterns."""
-    hits = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if any(p.search(line) for p in patterns):
-                    hits.append(line.rstrip())
-    except (OSError, PermissionError):
-        pass
-    return hits
-
-
-def file_exists(root: Path, *parts: str) -> bool:
-    return (root / Path(*parts)).exists()
-
-
 def read_file_safe(path: Path, max_bytes: int = 16_384) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
