@@ -19,10 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from count_merged_prs import (
+    count_bitbucket_merged,
     count_github_merged,
     count_gitlab_merged,
     github_api,
     gitlab_api,
+    list_bitbucket_repos,
     list_github_repos,
     list_gitlab_projects,
     paginate_github,
@@ -263,6 +265,90 @@ def export_github_repos(
         "error": org_error,
         "csv_path": str(out_path),
     }
+
+
+def _export_bitbucket(
+    token: str,
+    repos: list[str],
+    workspace_label: str,
+    token_name: str,
+    output_dir: Path,
+    username: str = "",
+) -> dict[str, Any]:
+    """Shared merged-PR-count export for Bitbucket repos (workspace/repo)."""
+    filename = safe_filename(f"{workspace_label}.csv")
+    out_path = output_dir / filename
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    org_error = ""
+
+    print(f"  Bitbucket repos: {len(repos)} repo(s)", flush=True)
+    for idx, repo in enumerate(repos, start=1):
+        workspace = repo.split("/")[0]
+        error = ""
+        count = 0
+        try:
+            count = count_bitbucket_merged(token, repo, username, None, None)
+        except Exception as exc:
+            error = str(exc)
+            org_error = org_error or error
+        rows.append(
+            {
+                "platform": "bitbucket",
+                "org": workspace,
+                "repo": repo,
+                "merged_count": count,
+                "error": error,
+            }
+        )
+        print(f"    [{idx}/{len(repos)}] {repo} count={count}", flush=True)
+
+    merged_total = write_org_csv(out_path, "bitbucket", repos[0].split("/")[0], rows)
+    return {
+        "platform": "bitbucket",
+        "repos": repos,
+        "repos_total": len(repos),
+        "merged_total": merged_total,
+        "token_name": token_name,
+        "error": org_error,
+        "csv_path": str(out_path),
+    }
+
+
+def export_bitbucket_workspace(
+    token: str,
+    workspace: str,
+    token_name: str,
+    output_dir: Path,
+    username: str = "",
+) -> dict[str, Any]:
+    """Export merged PR counts for every repo in a Bitbucket workspace."""
+    repos = list_bitbucket_repos(token, workspace, username)
+    return _export_bitbucket(token, repos, workspace, token_name, output_dir, username)
+
+
+def export_bitbucket_repos(
+    token: str,
+    repos: list[str],
+    token_name: str,
+    output_dir: Path,
+    username: str = "",
+) -> dict[str, Any]:
+    """Export merged PR counts for one or more specific Bitbucket repos."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for repo in repos:
+        r = repo.strip().strip("/")
+        if not r or r in seen:
+            continue
+        if "/" not in r:
+            raise ValueError(f"Bitbucket repo must be workspace/repo (got {r!r})")
+        seen.add(r)
+        normalized.append(r)
+    if not normalized:
+        raise ValueError("At least one Bitbucket repo path is required")
+    label = normalized[0].replace("/", "_") if len(normalized) == 1 else f"bitbucket_repos_{len(normalized)}"
+    return _export_bitbucket(token, normalized, label, token_name, output_dir, username)
 
 
 def export_gitlab_projects(

@@ -103,6 +103,7 @@ VERSION = "1.2.1"
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 GITHUB_REST_URL = "https://api.github.com"
 GITLAB_REST_URL = "https://gitlab.com/api/v4"
+BITBUCKET_REST_URL = "https://api.bitbucket.org/2.0"
 DEFAULT_MODEL = "gpt-4o-mini"
 CATEGORIES = ["simple_fix", "standard_feature_work", "rich_task", "other"]
 
@@ -462,9 +463,24 @@ def fetch_merged_prs(
 
     logger.info("Fetching merged PRs for %s...", repo)
     while True:
-        page += 1
         variables = {"owner": owner, "name": name, "cursor": cursor, "pageSize": page_size}
-        data = github_graphql(token, GRAPHQL_QUERY, variables)
+        try:
+            data = github_graphql(token, GRAPHQL_QUERY, variables)
+        except RuntimeError as exc:
+            # A 502/503/504 means GitHub's gateway timed out on a too-expensive
+            # query (huge repo). Shrinking the page makes each query cheap enough
+            # to serve; halve and retry the SAME cursor rather than giving up.
+            msg = str(exc)
+            transient = any(s in msg for s in ("502", "503", "504")) or "timeout" in msg.lower()
+            if transient and page_size > 1:
+                page_size = max(1, page_size // 2)
+                logger.warning(
+                    "Query too heavy for %s; shrinking page size to %d and retrying same page.",
+                    repo, page_size,
+                )
+                continue
+            raise
+        page += 1
         pr_connection = data["repository"]["pullRequests"]
 
         nodes = pr_connection["nodes"] or []
@@ -752,6 +768,231 @@ def fetch_merged_gitlab_mrs(
             time.sleep(sleep_seconds)
 
     logger.info("Total merged MRs fetched for %s: %d", project, len(done_iids))
+    if jsonl_path is not None and jsonl_path.exists():
+        all_prs = _load_jsonl(jsonl_path)
+        jsonl_path.unlink(missing_ok=True)
+        if state_path:
+            state_path.unlink(missing_ok=True)
+        return all_prs
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bitbucket (REST 2.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bitbucket_auth_header(token: str, username: str = "") -> str:
+    import base64
+    user = username.strip() or "x-bitbucket-api-token-auth"
+    return "Basic " + base64.b64encode(f"{user}:{token}".encode()).decode()
+
+
+def bitbucket_rest_get(
+    token: str,
+    url: str,
+    username: str = "",
+    max_retries: int = 8,
+) -> Any:
+    """GET an absolute Bitbucket URL, with the same retry discipline as GitLab."""
+    headers = {
+        "Authorization": _bitbucket_auth_header(token, username),
+        "Accept": "application/json",
+        "User-Agent": "pr_task_profile_report",
+    }
+    last_err: Optional[str] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=120)
+        except requests.RequestException as exc:
+            last_err = f"network error: {exc}"
+            logger.warning("Bitbucket REST failed (attempt %d/%d): %s", attempt, max_retries, exc)
+            time.sleep(min(2 ** attempt, 30))
+            continue
+        if response.status_code in (429, 502, 503, 504):
+            wait = min(2 ** attempt, 60)
+            last_err = f"HTTP {response.status_code}"
+            logger.warning(
+                "Bitbucket transient error (status %s). Waiting %ss (attempt %d/%d).",
+                response.status_code, wait, attempt, max_retries,
+            )
+            time.sleep(wait)
+            continue
+        if response.status_code == 404:
+            raise RuntimeError(f"Bitbucket REST 404 (not found or no access): {url}")
+        if response.status_code >= 400:
+            raise RuntimeError(f"Bitbucket REST error: {response.status_code}")
+        if response.status_code == 204 or not response.text:
+            return None
+        try:
+            return response.json()
+        except ValueError:
+            wait = min(2 ** attempt, 60)
+            last_err = "non-JSON body"
+            time.sleep(wait)
+            continue
+    raise RuntimeError(f"Bitbucket REST failed after {max_retries} retries. Last error: {last_err}")
+
+
+def bitbucket_rest_paginated(token: str, url: str, username: str = "") -> List[Any]:
+    """Follow Bitbucket's `next` cursor, collecting every `values` item."""
+    results: List[Any] = []
+    while url:
+        page = bitbucket_rest_get(token, url, username)
+        if not isinstance(page, dict):
+            break
+        results.extend(page.get("values", []))
+        url = page.get("next", "")
+    return results
+
+
+def _bitbucket_actor(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not user:
+        return {}
+    login = user.get("nickname") or user.get("display_name") or ""
+    is_bot = user.get("type") == "app" or "bot" in login.lower()
+    return {"login": login, "__typename": "Bot" if is_bot else "User"}
+
+
+def normalize_bitbucket_pr(
+    pr: Dict[str, Any],
+    diffstat: List[Dict[str, Any]],
+    comments: List[Dict[str, Any]],
+    participants: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    paths: List[str] = []
+    additions = 0
+    deletions = 0
+    for entry in diffstat:
+        new = (entry.get("new") or {}).get("path")
+        old = (entry.get("old") or {}).get("path")
+        p = new or old
+        if p:
+            paths.append(p)
+        additions += int(entry.get("lines_added") or 0)
+        deletions += int(entry.get("lines_removed") or 0)
+
+    issue_comment_nodes: List[Dict[str, Any]] = []
+    review_nodes: List[Dict[str, Any]] = []
+    thread_nodes: List[Dict[str, Any]] = []
+    for c in comments:
+        if c.get("deleted"):
+            continue
+        body = ((c.get("content") or {}).get("raw") or "").strip()
+        if not body:
+            continue
+        author = _bitbucket_actor(c.get("user"))
+        inline = c.get("inline")
+        if inline:
+            path = inline.get("path") or ""
+            thread_nodes.append({
+                "isResolved": bool(c.get("resolved")),
+                "comments": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [{"bodyText": body, "author": author, "path": path}],
+                },
+            })
+            review_nodes.append({"state": "COMMENTED", "bodyText": body, "author": author})
+        else:
+            issue_comment_nodes.append({"bodyText": body, "author": author})
+
+    # Bitbucket "approved" participants -> approving reviews.
+    for part in participants:
+        if part.get("approved"):
+            review_nodes.append({
+                "state": "APPROVED",
+                "bodyText": "",
+                "author": _bitbucket_actor(part.get("user")),
+            })
+
+    return {
+        "number": pr.get("id"),
+        "title": pr.get("title") or "",
+        "bodyText": (pr.get("description") or "") if isinstance(pr.get("description"), str)
+                    else ((pr.get("rendered") or {}).get("description", {}) or {}).get("raw", ""),
+        "url": ((pr.get("links") or {}).get("html") or {}).get("href"),
+        "mergedAt": pr.get("updated_on"),
+        "changedFiles": len(paths),
+        "additions": additions,
+        "deletions": deletions,
+        "author": _bitbucket_actor(pr.get("author")),
+        "labels": {"nodes": []},
+        "commits": {"totalCount": int(pr.get("comment_count", 0) >= 0)},
+        "files": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [{"path": p} for p in paths],
+        },
+        "closingIssuesReferences": {"nodes": []},
+        "comments": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": issue_comment_nodes,
+        },
+        "reviews": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": review_nodes,
+        },
+        "reviewThreads": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": thread_nodes,
+        },
+    }
+
+
+def fetch_merged_bitbucket_prs(
+    token: str,
+    repo: str,
+    sleep_seconds: float,
+    username: str = "",
+    checkpoint_dir: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    workspace, name = repo.split("/", 1)
+    base = f"{BITBUCKET_REST_URL}/repositories/{workspace}/{name}"
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", f"bitbucket_{repo}")
+    jsonl_path = state_path = None
+    done_ids: set = set()
+
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = checkpoint_dir / f"{slug}_prs.jsonl"
+        state_path = checkpoint_dir / f"{slug}_fetch_state.json"
+        if jsonl_path.exists():
+            for row in _load_jsonl(jsonl_path):
+                pid = row.get("number")
+                if pid is not None:
+                    done_ids.add(int(pid))
+            if done_ids:
+                logger.info("Resuming Bitbucket fetch for %s (%d PRs on disk)...", repo, len(done_ids))
+
+    logger.info("Fetching merged PRs for Bitbucket %s...", repo)
+    pr_list = bitbucket_rest_paginated(token, f"{base}/pullrequests?state=MERGED&pagelen=50", username)
+
+    fetched = 0
+    for pr in pr_list:
+        pid = pr.get("id")
+        if pid is None or int(pid) in done_ids:
+            continue
+        # description isn't in the list payload; fetch the PR detail
+        detail = bitbucket_rest_get(token, f"{base}/pullrequests/{pid}", username) or pr
+        diffstat = bitbucket_rest_paginated(token, f"{base}/pullrequests/{pid}/diffstat?pagelen=100", username)
+        comments = bitbucket_rest_paginated(token, f"{base}/pullrequests/{pid}/comments?pagelen=100", username)
+        participants = detail.get("participants") or []
+        normalized = normalize_bitbucket_pr(detail, diffstat, comments, participants)
+
+        if jsonl_path is not None:
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(normalized, ensure_ascii=False) + "\n")
+        done_ids.add(int(pid))
+        fetched += 1
+        if fetched % 25 == 0 or fetched == 1:
+            logger.info("  enriched %d new PRs (%d total on disk)", fetched, len(done_ids))
+        if state_path is not None:
+            state_path.write_text(
+                json.dumps({"repo": repo, "count": len(done_ids), "last_id": pid}, indent=2),
+                encoding="utf-8",
+            )
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    logger.info("Total merged PRs fetched for %s: %d", repo, len(done_ids))
     if jsonl_path is not None and jsonl_path.exists():
         all_prs = _load_jsonl(jsonl_path)
         jsonl_path.unlink(missing_ok=True)
@@ -1681,6 +1922,10 @@ def main() -> None:
         "--gitlab-project", action="append", default=None,
         help="GitLab project path (group/project). Repeatable / comma-separated.",
     )
+    parser.add_argument(
+        "--bitbucket-repo", action="append", default=None,
+        help="Bitbucket repo path (workspace/repo). Repeatable / comma-separated.",
+    )
     parser.add_argument("--include-archived", action="store_true",
                         help="Include archived repos when expanding an org/user.")
     parser.add_argument("--no-forks", dest="include_forks", action="store_false",
@@ -1699,9 +1944,11 @@ def main() -> None:
 
     has_github = bool(args.repo or args.org or args.user)
     has_gitlab = bool(args.gitlab_group or args.gitlab_project)
-    if not (has_github or has_gitlab):
+    has_bitbucket = bool(args.bitbucket_repo)
+    if not (has_github or has_gitlab or has_bitbucket):
         parser.error(
-            "Provide at least one of --repo, --org, --user, --gitlab-group, or --gitlab-project."
+            "Provide at least one of --repo, --org, --user, --gitlab-group, "
+            "--gitlab-project, or --bitbucket-repo."
         )
 
     started_at = datetime.now(timezone.utc)
@@ -1732,11 +1979,16 @@ def main() -> None:
 
     github_token = os.getenv("GITHUB_TOKEN")
     gitlab_token = os.getenv("GITLAB_TOKEN")
+    bitbucket_token = os.getenv("BITBUCKET_TOKEN")
+    bitbucket_username = os.getenv("BITBUCKET_USERNAME", "")
     if has_github and not github_token:
         logger.error("GITHUB_TOKEN is not set (env or .env). Aborting.")
         sys.exit(1)
     if has_gitlab and not gitlab_token:
         logger.error("GITLAB_TOKEN is not set (env or .env). Aborting.")
+        sys.exit(1)
+    if has_bitbucket and not bitbucket_token:
+        logger.error("BITBUCKET_TOKEN is not set (env or .env). Aborting.")
         sys.exit(1)
     if not llm_available():
         logger.error(
@@ -1776,6 +2028,17 @@ def main() -> None:
             logger.exception("Failed to resolve GitLab targets: %s", exc)
             sys.exit(1)
 
+    if has_bitbucket:
+        bb_repos: List[str] = []
+        seen_bb: set = set()
+        for raw in args.bitbucket_repo:
+            for part in raw.split(","):
+                r = part.strip().strip("/")
+                if r and r not in seen_bb:
+                    seen_bb.add(r)
+                    bb_repos.append(r)
+        scan_targets.extend(("bitbucket", r) for r in bb_repos)
+
     if not scan_targets:
         logger.warning("No repositories resolved from the given targets. Nothing to do.")
         sys.exit(0)
@@ -1804,6 +2067,14 @@ def main() -> None:
                     sleep_seconds=args.sleep,
                     checkpoint_dir=Path(args.output_dir) / "checkpoints",
                     page_size=args.page_size,
+                )
+            elif platform == "bitbucket":
+                prs = fetch_merged_bitbucket_prs(
+                    token=bitbucket_token,
+                    repo=repo,
+                    sleep_seconds=args.sleep,
+                    username=bitbucket_username,
+                    checkpoint_dir=Path(args.output_dir) / "checkpoints",
                 )
             else:
                 prs = fetch_merged_gitlab_mrs(

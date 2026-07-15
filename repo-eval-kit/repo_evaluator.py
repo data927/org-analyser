@@ -3817,7 +3817,13 @@ def _install_git_auth(platform: str, token: str) -> None:
     if not token:
         return
     host = {"gitlab": "gitlab.com", "bitbucket": "bitbucket.org"}.get(platform, "github.com")
-    auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    if platform == "bitbucket":
+        # Bitbucket basic-auth username: the real username for an app password,
+        # else the x-token-auth sentinel for a workspace/repo access token.
+        user = os.environ.get("BITBUCKET_USERNAME", "").strip() or "x-token-auth"
+    else:
+        user = "x-access-token"  # ignored by GitHub/GitLab; must be non-empty
+    auth = base64.b64encode(f"{user}:{token}".encode()).decode()
     os.environ["GIT_CONFIG_COUNT"] = "1"
     os.environ["GIT_CONFIG_KEY_0"] = f"http.https://{host}/.extraHeader"
     os.environ["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"

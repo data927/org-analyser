@@ -3,6 +3,12 @@
 github-data-token=ghp_your_github_token_here
 gitlab_token=glpat_your_gitlab_token_here
 
+# Bitbucket (only if analyzing a Bitbucket workspace/repo).
+# Use EITHER a workspace/repo API token (leave bitbucket_username blank),
+# OR an app password (set bitbucket_username to your Bitbucket username).
+# bitbucket_token=your_bitbucket_token_or_app_password_here
+# bitbucket_username=your_bitbucket_username_here
+
 # ── LLM provider ──────────────────────────────────────────────────────────────
 # Use EITHER OpenAI directly, OR Azure AI Foundry / Azure OpenAI.
 

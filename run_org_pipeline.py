@@ -138,11 +138,17 @@ for _k, _v in (
 ):
     os.environ.setdefault(_k, _v)
 
-from count_merged_prs import list_github_repos, list_gitlab_projects  # noqa: E402
+from count_merged_prs import (  # noqa: E402
+    list_bitbucket_repos,
+    list_github_repos,
+    list_gitlab_projects,
+)
 from credential_redactor import scrub_secrets  # noqa: E402
 from export_all_merged_prs import (  # noqa: E402
     CSV_FIELDS,
     SUMMARY_FIELDS,
+    export_bitbucket_repos,
+    export_bitbucket_workspace,
     export_github_org,
     export_github_repos,
     export_gitlab_group,
@@ -151,6 +157,10 @@ from export_all_merged_prs import (  # noqa: E402
 )
 GITHUB_TOKEN_NAME = "github-data-token"
 GITLAB_TOKEN_NAME = "gitlab_token"
+BITBUCKET_TOKEN_NAME = "bitbucket_token"
+# Optional: for Bitbucket app passwords, which authenticate as username+password.
+# With a workspace/repo access token, leave the username blank.
+BITBUCKET_USERNAME_NAME = "bitbucket_username"
 OPENAI_TOKEN_NAMES = ("openai_key", "OPENAI_API_KEY")
 # Azure AI Foundry / Azure OpenAI settings the tokens file may carry; promoted
 # into the environment at startup (see build_run_context validation).
@@ -214,6 +224,7 @@ class RunContext:
     repos_manifest: dict[str, str]
     gitlab_projects: list[str]
     github_repos: list[str]
+    bitbucket_repos: list[str]
     profiler_template: Path
     profiler_out: Path
     manifest: dict[str, Any] = field(default_factory=dict)
@@ -343,6 +354,26 @@ def normalize_gitlab_projects(values: list[str]) -> list[str]:
                 f"GitLab project path must be group/project (got {project!r})"
             )
     return projects
+
+
+def normalize_bitbucket_repos(values: list[str]) -> list[str]:
+    repos: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        for part in raw.split(","):
+            repo = part.strip().strip("/")
+            if not repo or repo in seen:
+                continue
+            seen.add(repo)
+            repos.append(repo)
+    if not repos:
+        raise ValueError("At least one --bitbucket-repo path is required")
+    for repo in repos:
+        if "/" not in repo:
+            raise ValueError(
+                f"Bitbucket repo path must be workspace/repo (got {repo!r})"
+            )
+    return repos
 
 
 def parse_git_remote(repo_path: Path) -> tuple[str, str] | None:
@@ -489,6 +520,15 @@ def preflight(ctx: RunContext, log: PipelineLogger) -> None:
                     errors.append(
                         f"GitHub repo path must be owner/repo (got {repo!r})"
                     )
+    elif ctx.platform in ("bitbucket", "bitbucket-repo"):
+        if not ctx.tokens.get(BITBUCKET_TOKEN_NAME):
+            errors.append(f"Missing {BITBUCKET_TOKEN_NAME} in tokens file")
+        if ctx.platform == "bitbucket-repo":
+            for repo in ctx.bitbucket_repos:
+                if "/" not in repo:
+                    errors.append(
+                        f"Bitbucket repo path must be workspace/repo (got {repo!r})"
+                    )
     elif ctx.platform in ("gitlab", "gitlab-project"):
         if not ctx.tokens.get(GITLAB_TOKEN_NAME):
             errors.append(f"Missing {GITLAB_TOKEN_NAME} in tokens file")
@@ -569,6 +609,18 @@ def discover_repos(ctx: RunContext, log: PipelineLogger) -> list[RepoEntry]:
         for repo in ctx.github_repos:
             owner = repo.split("/")[0]
             entries.append(RepoEntry("github", repo, owner, owner))
+    elif ctx.platform == "bitbucket":
+        token = ctx.tokens[BITBUCKET_TOKEN_NAME]
+        names = list_bitbucket_repos(token, ctx.target,
+                                     ctx.tokens.get(BITBUCKET_USERNAME_NAME, ""))
+        entries = [
+            RepoEntry("bitbucket", name, ctx.target, ctx.target) for name in names
+        ]
+    elif ctx.platform == "bitbucket-repo":
+        entries = []
+        for repo in ctx.bitbucket_repos:
+            workspace = repo.split("/")[0]
+            entries.append(RepoEntry("bitbucket", repo, workspace, workspace))
     elif ctx.platform == "gitlab-project":
         entries = []
         for project in ctx.gitlab_projects:
@@ -603,6 +655,22 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
             ctx.github_token_name,
             ctx.merged_pr_dir,
             ctx.github_host,
+        )
+    elif ctx.platform == "bitbucket":
+        summary = export_bitbucket_workspace(
+            ctx.tokens[BITBUCKET_TOKEN_NAME],
+            ctx.target,
+            BITBUCKET_TOKEN_NAME,
+            ctx.merged_pr_dir,
+            ctx.tokens.get(BITBUCKET_USERNAME_NAME, ""),
+        )
+    elif ctx.platform == "bitbucket-repo":
+        summary = export_bitbucket_repos(
+            ctx.tokens[BITBUCKET_TOKEN_NAME],
+            ctx.bitbucket_repos,
+            BITBUCKET_TOKEN_NAME,
+            ctx.merged_pr_dir,
+            ctx.tokens.get(BITBUCKET_USERNAME_NAME, ""),
         )
     elif ctx.platform == "gitlab-project":
         summary = export_gitlab_projects(
@@ -649,6 +717,8 @@ def clone_url(entry: RepoEntry, tokens: dict[str, str], ctx: RunContext) -> str:
         if host == "github.com":
             return f"https://github.com/{entry.full_name}.git"
         return f"https://{host}/{entry.full_name}.git"
+    if entry.platform == "bitbucket":
+        return f"https://bitbucket.org/{entry.full_name}.git"
     host = ctx.gitlab_host.rstrip("/")
     if not host.startswith("http"):
         host = f"https://{host}"
@@ -674,12 +744,17 @@ def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | No
     # GIT_CONFIG_COUNT/KEY/VALUE is the real mechanism, and unlike `-c` it keeps
     # the token off argv.
     token = ""
+    user = "x-access-token"  # ignored by GitHub/GitLab; must be non-empty
     if entry.platform == "github":
         token = ctx.tokens.get(ctx.github_token_name, "")
     elif entry.platform == "gitlab":
         token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
+    elif entry.platform == "bitbucket":
+        token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
+        # app password -> real username; access token -> x-token-auth sentinel
+        user = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "").strip() or "x-token-auth"
     if token:
-        auth = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        auth = base64.b64encode(f"{user}:{token}".encode()).decode()
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
         env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"
@@ -843,6 +918,10 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         platform = "github"
         token = ctx.tokens[ctx.github_token_name]
         repo_arg = entry.full_name
+    elif entry.platform == "bitbucket":
+        platform = "bitbucket"
+        token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
+        repo_arg = f"bitbucket:{entry.full_name}"
     else:
         platform = "gitlab"
         token = ctx.tokens[GITLAB_TOKEN_NAME]
@@ -854,10 +933,18 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
     if ctx.skip_f2p:
         args.append("--skip-f2p")
 
+    extra_env: dict[str, str] = {}
+    if token:
+        extra_env["REPO_EVAL_TOKEN"] = token
+    if platform == "bitbucket":
+        bb_user = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "").strip()
+        if bb_user:
+            extra_env["BITBUCKET_USERNAME"] = bb_user
+
     code, out, err = run_py(
         EVAL_KIT / "repo_evaluator.py",
         args,
-        extra_env={"REPO_EVAL_TOKEN": token} if token else None,
+        extra_env=extra_env or None,
         timeout=7200,
         cwd=EVAL_KIT,
     )
@@ -964,10 +1051,16 @@ def run_pr_task_profile(
     env = os.environ.copy()
     gh_token = ctx.tokens.get(ctx.github_token_name, "")
     gl_token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
+    bb_token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
+    bb_user = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "")
     if gh_token:
         env["GITHUB_TOKEN"] = gh_token
     if gl_token:
         env["GITLAB_TOKEN"] = gl_token
+    if bb_token:
+        env["BITBUCKET_TOKEN"] = bb_token
+    if bb_user:
+        env["BITBUCKET_USERNAME"] = bb_user
 
     args = [
         "--output-dir",
@@ -981,6 +1074,10 @@ def run_pr_task_profile(
     elif ctx.platform == "github-repo":
         for repo in ctx.github_repos:
             args.extend(["--repo", repo])
+    elif ctx.platform in ("bitbucket", "bitbucket-repo"):
+        # pr_task_profile doesn't expand workspaces; pass each discovered repo.
+        for entry in entries:
+            args.extend(["--bitbucket-repo", entry.full_name])
     elif ctx.platform == "gitlab":
         args.extend(["--gitlab-group", ctx.target])
     elif ctx.platform == "gitlab-project":
@@ -1180,6 +1277,7 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
     tokens = parse_tokens_file(Path(args.tokens_file))
     gitlab_projects: list[str] = []
     github_repos: list[str] = []
+    bitbucket_repos: list[str] = []
     if args.local_repos_dir:
         platform = "local"
         target = args.local_batch_name
@@ -1195,6 +1293,19 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
             github_repos[0]
             if len(github_repos) == 1
             else f"github-repos ({len(github_repos)} repos)"
+        )
+        local_repos_dir = None
+    elif args.bitbucket_workspace:
+        platform = "bitbucket"
+        target = args.bitbucket_workspace
+        local_repos_dir = None
+    elif args.bitbucket_repo:
+        platform = "bitbucket-repo"
+        bitbucket_repos = normalize_bitbucket_repos(args.bitbucket_repo)
+        target = (
+            bitbucket_repos[0]
+            if len(bitbucket_repos) == 1
+            else f"bitbucket-repos ({len(bitbucket_repos)} repos)"
         )
         local_repos_dir = None
     elif args.gitlab_project:
@@ -1228,6 +1339,8 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
         run_label = f"gitlab-projects-{len(gitlab_projects)}"
     elif platform == "github-repo" and len(github_repos) > 1:
         run_label = f"github-repos-{len(github_repos)}"
+    elif platform == "bitbucket-repo" and len(bitbucket_repos) > 1:
+        run_label = f"bitbucket-repos-{len(bitbucket_repos)}"
     else:
         run_label = safe_filename(target.replace("/", "_").replace(" ", "_"))
     run_name = f"org-pipeline-{run_label}-{stamp}"
@@ -1261,6 +1374,7 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
         repos_manifest=repos_manifest,
         gitlab_projects=gitlab_projects,
         github_repos=github_repos,
+        bitbucket_repos=bitbucket_repos,
         profiler_template=profiler_template,
         profiler_out=run_dir / "codebase-profiler" / "codebase_sheet.filled.xlsx",
         pipeline_log=run_dir / "logs" / "pipeline.log",
@@ -1283,6 +1397,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Single GitHub repo path (repeatable, or comma-separated). "
             "Example: --github-repo data-tech/frontend --github-repo data-tech/backend"
+        ),
+    )
+    target.add_argument("--bitbucket-workspace", help="Bitbucket workspace to process")
+    target.add_argument(
+        "--bitbucket-repo",
+        action="append",
+        metavar="WORKSPACE/REPO",
+        help=(
+            "Bitbucket repo path (repeatable, or comma-separated). "
+            "Example: --bitbucket-repo my-team/frontend --bitbucket-repo my-team/backend"
         ),
     )
     target.add_argument("--gitlab-group", help="GitLab top-level group to process")

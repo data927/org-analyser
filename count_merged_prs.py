@@ -14,6 +14,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import sys
@@ -109,6 +110,78 @@ def in_range(dt_str: str | None, since: datetime | None, until: datetime | None)
     if until and dt > until:
         return False
     return True
+
+
+def bitbucket_headers(token: str, username: str = "") -> dict[str, str]:
+    # App password -> username:token; workspace/repo access token ->
+    # x-bitbucket-api-token-auth:token. Both are HTTP Basic.
+    user = username.strip() or "x-bitbucket-api-token-auth"
+    creds = base64.b64encode(f"{user}:{token}".encode()).decode()
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Basic {creds}",
+        "User-Agent": "count-merged-prs",
+    }
+
+
+def paginate_bitbucket(url: str, token: str, username: str = "") -> list[Any]:
+    """Follow Bitbucket's `next` cursor links, collecting every `values` item."""
+    items: list[Any] = []
+    headers = bitbucket_headers(token, username)
+    while url:
+        data, _ = http_get_json(url, headers)
+        if not isinstance(data, dict):
+            break
+        items.extend(data.get("values", []))
+        url = data.get("next", "")
+    return items
+
+
+def list_bitbucket_repos(token: str, workspace: str, username: str = "") -> list[str]:
+    repos = paginate_bitbucket(
+        f"https://api.bitbucket.org/2.0/repositories/{workspace}?pagelen=100",
+        token, username,
+    )
+    names = [r["full_name"] for r in repos if r.get("full_name")]
+    if not names:
+        raise RuntimeError(f"No Bitbucket repos found for {workspace!r}")
+    return names
+
+
+def count_bitbucket_merged(
+    token: str,
+    repo: str,
+    username: str,
+    since: datetime | None,
+    until: datetime | None,
+) -> int:
+    workspace, name = repo.split("/", 1)
+    base = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{name}/pullrequests?state=MERGED"
+    headers = bitbucket_headers(token, username)
+    if since is None and until is None:
+        # Bitbucket returns the total in `size` on the first page.
+        data, _ = http_get_json(f"{base}&pagelen=1", headers)
+        if isinstance(data, dict) and "size" in data:
+            return int(data["size"])
+        # Fallback: full pagination if `size` is absent.
+        return len(paginate_bitbucket(f"{base}&pagelen=50", token, username))
+    prs = paginate_bitbucket(f"{base}&pagelen=50", token, username)
+    return sum(
+        1 for pr in prs if in_range(pr.get("updated_on"), since, until)
+    )
+
+
+def bitbucket_merged_counts(
+    token: str,
+    repos: list[str],
+    username: str,
+    since: datetime | None,
+    until: datetime | None,
+) -> dict[str, int]:
+    return {
+        repo: count_bitbucket_merged(token, repo, username, since, until)
+        for repo in repos
+    }
 
 
 def github_api(token: str, host: str = "github.com") -> str:
