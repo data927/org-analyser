@@ -116,11 +116,21 @@ def bitbucket_headers(token: str, username: str = "") -> dict[str, str]:
     headers = {"Accept": "application/json", "User-Agent": "count-merged-prs"}
     if not token:
         return headers  # anonymous: fine for public repos (lower rate limit)
-    # App password -> username:token; workspace/repo access token ->
-    # x-bitbucket-api-token-auth:token. Both are HTTP Basic.
-    user = username.strip() or "x-bitbucket-api-token-auth"
-    creds = base64.b64encode(f"{user}:{token}".encode()).decode()
-    headers["Authorization"] = f"Basic {creds}"
+    user = username.strip()
+    if user:
+        # App password (Bitbucket username) or Atlassian API token (email) → Basic.
+        creds = base64.b64encode(f"{user}:{token}".encode()).decode()
+        headers["Authorization"] = f"Basic {creds}"
+    elif token.startswith("ATATT"):
+        # The static "x-bitbucket-api-token-auth" user works for git but NOT the
+        # REST API — it returns a misleading "Token is invalid" / empty results.
+        raise RuntimeError(
+            "Atlassian API token (ATATT…) needs your Atlassian account email. "
+            "Set bitbucket_username to that email in the tokens file."
+        )
+    else:
+        # Workspace/Repository/Project access token → Bearer.
+        headers["Authorization"] = f"Bearer {token}"
     return headers
 
 
