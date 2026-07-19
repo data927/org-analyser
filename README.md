@@ -53,6 +53,7 @@ aborts with zero clones made if anything's wrong.
 org-analyser --github-org <ORG_NAME> --workers 10        # whole org
 org-analyser --github-repo <OWNER>/<REPO>                 # single repo
 org-analyser --local-repos-dir ./repos --workers 4         # local checkouts
+org-analyser --github-org <ORG_NAME> --skip-pr-task-profile # skip only the PR task-profile phase
 ```
 
 Same flags work for `--gitlab-group`/`--gitlab-project` and

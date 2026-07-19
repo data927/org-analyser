@@ -4077,6 +4077,14 @@ def main():
         default=int(os.environ.get("TAXONOMY_CONCURRENCY", "8")),
         help="Max parallel taxonomy LLM calls per repo (default: 8 or TAXONOMY_CONCURRENCY env)",
     )
+    parser.add_argument(
+        "--taxonomy-llm-mode",
+        choices=("auto", "batch", "sync"),
+        default="auto",
+        help="Taxonomy classification path: 'sync' = live chat.completions per PR "
+        "(concurrent), 'batch' = OpenAI Batch API, 'auto' = batch once PR count "
+        ">= threshold (default: auto).",
+    )
 
     args = parser.parse_args()
 
@@ -4256,6 +4264,7 @@ def main():
                     if args.output
                     else None
                 ),
+                llm_mode=args.taxonomy_llm_mode,
             )
             report_json.update(taxonomy_results)
             if pr_taxonomy:

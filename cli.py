@@ -244,6 +244,7 @@ class RunContext:
     retries: int
     clone_depth: int | None
     skip_f2p: bool
+    skip_pr_task_profile: bool
     pr_rubrics_provider: str
     local_only: bool
     github_host: str
@@ -1077,6 +1078,10 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         args.append("--skip-quality-llm")
         args.append("--skip-pr-rubrics")
     args.extend(["--pr-rubrics-provider", ctx.pr_rubrics_provider])
+    # Pipeline eval-kit runs use live chat.completions for taxonomy rather than
+    # the Batch API: each repo is a separate subprocess with its own timeout, so
+    # a 24h batch queue would stall the whole per-repo pool.
+    args.extend(["--taxonomy-llm-mode", "sync"])
 
     extra_env: dict[str, str] = {}
     if token:
@@ -1690,6 +1695,7 @@ def build_run_context(
         retries=args.retries,
         clone_depth=args.clone_depth if args.clone_depth > 0 else None,
         skip_f2p=args.skip_f2p,
+        skip_pr_task_profile=args.skip_pr_task_profile,
         pr_rubrics_provider=args.pr_rubrics_provider,
         local_only=local_only,
         github_host=args.github_host,
@@ -1824,6 +1830,13 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="Skip F2P/P2P test verification in eval-kit (the slowest phase: it "
         "installs deps and runs the test suite per accepted PR). Recommended "
         "for large repos.",
+    )
+    parser.add_argument(
+        "--skip-pr-task-profile",
+        action="store_true",
+        default=bool(CONFIG.get("skip_pr_task_profile", False)),
+        help="Skip the org-level PR task-profile phase (the flakiest/longest "
+        "phase: network/GraphQL with a 24h timeout). Other phases are unaffected.",
     )
     parser.add_argument(
         "--pr-rubrics-provider",
@@ -2064,16 +2077,15 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
         entries = discover_repos(ctx, log)
         ctx.manifest["repo_count"] = len(entries)
 
-        # merged-pr-counts and pr-task-profile hit the same hosting APIs the
-        # repo pool clones from, but need none of the clones themselves --
-        # nothing here depends on nothing the repo pool produces, so all three
-        # lanes run concurrently instead of the old sequential
-        # merged-pr-counts -> pr-task-profile -> repo-pool chain (pr-task-profile
-        # alone has a 24h timeout; blocking the repo pool behind it was the
-        # single biggest wall-clock cost in the old pipeline).
+        # merged-pr-counts runs concurrently with the repo pool (it only reads
+        # the hosting API, not the clones). pr-task-profile is deliberately held
+        # back to run LAST, once every other folder is written: it is the
+        # flakiest and longest phase (network/GraphQL, 24h timeout), so running
+        # it on its own at the end means a failure there can never block or
+        # taint the rest of the run's output.
         log.info(
             f"Per-repo phases: processing {len(entries)} repos with {ctx.workers} workers "
-            "(running alongside merged-pr-counts/pr-task-profile)"
+            "(alongside merged-pr-counts; pr-task-profile runs last)"
         )
         repo_results: list[dict[str, Any]] = []
         use_rich = should_use_rich(args.quiet)
@@ -2100,16 +2112,8 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
                 org_futures["merged-pr-counts"] = org_pool.submit(
                     run_org_phase, ctx, log, "merged-pr-counts", lambda: run_merged_pr_counts(ctx, log)
                 )
-            if progress_ui:
-                progress_ui.start_org_phase("pr-task-profile")
-            org_futures["pr-task-profile"] = org_pool.submit(
-                run_org_phase,
-                ctx,
-                log,
-                "pr-task-profile",
-                lambda: run_pr_task_profile(ctx, log, entries),
-            )
-
+            # pr-task-profile is NOT submitted here -- it runs last, after the
+            # repo pool and merged-pr-counts finish (see below).
             repo_futures = {repo_pool.submit(process_repo, e, ctx, log): e for e in entries}
             for i, fut in enumerate(as_completed(repo_futures), 1):
                 entry = repo_futures[fut]
@@ -2138,6 +2142,26 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
                 if progress_ui:
                     ok = not (isinstance(result, dict) and result.get("ok") is False)
                     progress_ui.finish_org_phase(name, ok)
+
+            # pr-task-profile runs LAST -- every repo phase and merged-pr-counts
+            # is done and written by now, so its network/GraphQL flakiness can
+            # only affect its own folder, never the rest of the run.
+            if ctx.skip_pr_task_profile:
+                log.info("pr-task-profile skipped (--skip-pr-task-profile)")
+                ctx.manifest["phases"]["pr-task-profile"] = {
+                    "skipped": True,
+                    "reason": "--skip-pr-task-profile",
+                }
+            else:
+                if progress_ui:
+                    progress_ui.start_org_phase("pr-task-profile")
+                task_result = run_org_phase(
+                    ctx, log, "pr-task-profile", lambda: run_pr_task_profile(ctx, log, entries)
+                )
+                ctx.manifest["phases"]["pr-task-profile"] = task_result
+                if progress_ui:
+                    ok = not (isinstance(task_result, dict) and task_result.get("ok") is False)
+                    progress_ui.finish_org_phase("pr-task-profile", ok)
 
         if ctx.include_quality_score:
             if ctx.state.org_phase_status(ctx.run_id, "aggregate-quality-org") in DONE_STATUSES:
