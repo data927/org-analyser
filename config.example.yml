@@ -1,0 +1,80 @@
+# org-analyser runtime config.
+# Copy to config.yml (gitignored, so local paths/settings never get committed) and
+# edit. Every value here is only a default — the matching CLI flag always wins.
+# With everything filled in below, `org-analyser` runs with zero flags.
+
+# Python interpreter used for subprocess phases. Same effect as exporting
+# ORG_ANALYSER_PYTHON. Leave null to auto-detect the active venv.
+python: null
+
+# API tokens. Fill in whichever platform(s) you're running against.
+tokens:
+  github-data-token: null   # ghp_... — required for --github-org / --github-repo
+  gitlab_token: null        # glpat_... — required for --gitlab-group / --gitlab-project
+  bitbucket_token: null     # workspace/repo access token or Atlassian API token (ATATT...) —
+                             # required to list a whole --bitbucket-workspace; optional for a
+                             # single public --bitbucket-repo
+  bitbucket_username: null  # only needed for Bitbucket app passwords (username+password auth);
+                             # leave blank when using a workspace/repo access token
+  openai_key: null          # sk-... — required unless OPENAI_API_KEY is set in the environment,
+                             # or Azure OpenAI is configured (AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY)
+
+# Optional: path to a separate key=value tokens file instead of the `tokens:`
+# mapping above (same key names). Only set this if you want tokens split out
+# of config.yml; leave null to use `tokens:` above.
+tokens_file: null
+
+# Optional JSON map of folder_name -> owner/repo (or gitlab:group/repo), used by
+# --local-repos-dir runs to attach PR/profiler data to local checkouts.
+repos_manifest: null
+
+# Parent directory for timestamped run folders.
+output_dir: outputs/org-analyser-runs
+
+# Parallel repo workers.
+workers: 10
+
+# Retries per repo per phase.
+retries: 3
+
+# Delete run folders older than this many days before starting a run (run
+# bundles contain contributor names/stats/scores, so unbounded retention is a
+# privacy problem). 0 disables the sweep. Same default (90) applies if this
+# key is left unset.
+retention_days: 90
+
+# Git clone depth (0 = full clone).
+clone_depth: 0
+
+github_host: github.com
+gitlab_host: gitlab.com
+
+# Key in the tokens file that holds the GitHub API token.
+github_token_name: github-data-token
+
+# Skip the sealed repo-quality-score phase and org rollup.
+skip_quality_score: false
+
+# Skip F2P/P2P test verification in eval-kit (the slowest phase: it installs
+# deps and runs the test suite per accepted PR). Recommended for large repos.
+skip_f2p: false
+
+# Never contact a remote API. Runs only the code-based analyses on local
+# checkouts and skips PR-based phases, even if a checkout still has an
+# 'origin' remote. Auto-enabled with --local-repos-dir when no repos-manifest
+# is set.
+local_only: false
+
+# Batch label for --local-repos-dir runs (used in output paths/run folder name).
+local_batch_name: local
+
+# Default run target — set exactly ONE of these, or leave all null/empty and
+# always pass --github-org/--github-repo/--bitbucket-workspace/--bitbucket-repo/
+# --gitlab-group/--gitlab-project/--local-repos-dir on the command line instead.
+github_org: null
+github_repo: []       # e.g. ["your-org/repo-a", "your-org/repo-b"]
+bitbucket_workspace: null
+bitbucket_repo: []    # e.g. ["your-team/repo-a", "your-team/repo-b"]
+gitlab_group: null
+gitlab_project: []    # e.g. ["your-group/repo-a"]
+local_repos_dir: null

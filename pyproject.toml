@@ -1,0 +1,43 @@
+[project]
+name = "org-analyser"
+version = "0.1.0"
+description = "Org/repo codebase analysis pipeline: merged-PR counts, PR task-profile, codebase profiler, eval-kit, repo quality score, and repo mirroring, in one installable package."
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "openai>=1.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "openpyxl>=3.1",
+    "pandas",
+    "click",
+    "certifi",
+]
+
+[project.optional-dependencies]
+ui = ["streamlit>=1.28"]
+
+[project.scripts]
+org-analyser = "cli:main"
+merged-prs = "analysis.merged_prs:main"
+pr-task-profile = "analysis.pr_task_profile:main"
+repo-analyzer = "analysis.repo_analyzer:main"
+codebase-profiler = "profiler.cli:main"
+repo-evaluator = "eval.repo_evaluator:main"
+run-all-repos = "eval.run_all_repos:main"
+bulk-svn-evaluator = "eval.bulk_svn_evaluator:main"
+bulk-repo-evaluator-parallel = "eval.bulk_repo_evaluator_parallel:main"
+consolidate-eval-output = "eval.consolidate_output:main"
+fill-vendor-template = "eval.fill_template:main"
+repo-mirror = "mirror.repo_mirror:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["analysis", "eval", "mirror", "profiler", "quality"]
+include = [
+    "cli.py",
+]

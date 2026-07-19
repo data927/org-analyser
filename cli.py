@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """
-Unified org pipeline: merged PR counts, PR task-profile report, codebase profiler,
-eval-kit (full LLM), and optionally repo-quality-score (sealed) for one GitHub org,
-one GitLab group, or a folder of downloaded/local repos per run.
+Unified repo pipeline: merged PR counts, PR task-profile report, repo-analyzer
+(vendor CSV), codebase profiler, eval-kit (full LLM), and optionally
+repo-quality-score (sealed) for one GitHub org, one GitLab group, one
+Bitbucket workspace, or a folder of downloaded/local repos per run.
+
+Tokens (github-data-token / gitlab_token / bitbucket_token / openai_key),
+workers, hosts, default target, etc. all live in config.yml's `tokens:`
+mapping and top-level keys at the repo root — see config.example.yml. CLI
+flags always override config.yml. Pass --tokens-file to use a separate
+key=value file instead.
 
 Usage:
-    python run_org_pipeline.py --github-org data-tech --tokens-file tokens --workers 10
-    python run_org_pipeline.py --github-repo data-tech/frontend --tokens-file tokens --workers 1
-    python run_org_pipeline.py --github-repo data-tech/repo-a --github-repo data-tech/repo-b --tokens-file tokens --workers 4
-    python run_org_pipeline.py --gitlab-group my-group --tokens-file tokens --workers 10
-    python run_org_pipeline.py --gitlab-project my-group/repo-a --gitlab-project my-group/repo-b --tokens-file tokens --workers 4
-    python run_org_pipeline.py --local-repos-dir ./my-repos --tokens-file tokens --workers 4
+    org-analyser --github-org your-org --workers 10
+    org-analyser --github-repo your-org/example-repo --workers 1
+    org-analyser --github-repo your-org/repo-a --github-repo your-org/repo-b --workers 4
+    org-analyser --gitlab-group your-group --workers 10
+    org-analyser --gitlab-project my-group/repo-a --gitlab-project my-group/repo-b --workers 4
+    org-analyser --bitbucket-workspace my-team --workers 10
+    org-analyser --bitbucket-repo my-team/frontend --bitbucket-repo my-team/backend --workers 4
+    org-analyser --local-repos-dir ./my-repos --workers 4
+    org-analyser --github-org your-org --skip-quality-score
+    org-analyser   # with target/tokens/etc. set in config.yml
 """
 
 from __future__ import annotations
@@ -25,7 +36,6 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import traceback
 import zipfile
@@ -35,18 +45,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-CODING = Path(__file__).resolve().parent
-EVAL_KIT = CODING / "repo-eval-kit"
-PROFILER_ROOT = CODING / "codebase_profiler"
-QUALITY_SKILL = CODING / "repo-quality-score"
-QUALITY_AGENT = CODING / "outputs" / "repo-quality-score-agent"
-SIGNAL_SCORER_DIR = CODING / "outputs" / "repo-quality-score"
-TASK_PROFILE_SCRIPT = CODING / "pr_task_profile_report.py"
-REPO_ANALYZER_SCRIPT = CODING / "repo_analyzer.py"
+import certifi
 
-# All per-repo profiler rows append to one shared workbook; the per-repo phases
-# run concurrently, so writes to it must be serialised (see run_profiler).
-_PROFILER_WRITE_LOCK = threading.Lock()
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+
+CODING = Path(__file__).resolve().parent
+PROFILER_ROOT = CODING / "profiler"
+EVAL_ROOT = CODING / "eval"
+QUALITY_SKILL = CODING / "quality"
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    """Load the optional root config.yml. Missing file -> empty config (all built-in defaults apply)."""
+    if not path.is_file():
+        return {}
+    import yaml  # noqa: WPS433
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"config file must be a YAML mapping: {path}")
+    return data
+
+
+CONFIG_PATH = Path(os.environ.get("ORG_ANALYSER_CONFIG", "") or (CODING / "config.yml"))
+CONFIG = load_config(CONFIG_PATH)
+
 
 def active_venv_python_candidates() -> list[str]:
     venv = os.environ.get("VIRTUAL_ENV", "").strip()
@@ -60,13 +84,13 @@ def active_venv_python_candidates() -> list[str]:
 
 
 PYTHON_CANDIDATES = [
-    os.environ.get("ORG_PIPELINE_PYTHON", ""),
+    os.environ.get("ORG_ANALYSER_PYTHON", ""),
+    CONFIG.get("python") or "",
     *active_venv_python_candidates(),
     sys.executable,
     str(CODING / ".venv" / "bin" / "python"),
     str(CODING / ".venv" / "Scripts" / "python.exe"),
     str(CODING / "env311" / "bin" / "python"),
-    str(PROFILER_ROOT / ".venv" / "bin" / "python"),
     shutil.which("python3.12") or "",
     shutil.which("python3.11") or "",
     shutil.which("python3.10") or "",
@@ -113,43 +137,12 @@ def resolve_clones_dir(run_dir: Path) -> Path:
         or os.environ.get("TEMP")
         or "C:\\Temp"
     )
-    return base / "org-pipeline-clones" / run_dir.name
+    return base / "org-analyser-clones" / run_dir.name
 
 
 sys.path.insert(0, str(CODING))
-sys.path.insert(0, str(PROFILER_ROOT))
-sys.path.insert(0, str(EVAL_KIT))
 
-# Load .env so LLM credentials (OPENAI_API_KEY or the AZURE_OPENAI_* set) are
-# in the environment and propagate to every child process the pipeline spawns.
-try:
-    from dotenv import load_dotenv  # noqa: E402
-
-    load_dotenv()
-except ImportError:
-    pass
-
-# Make git incapable of blocking on a human, whatever the host is configured
-# with. A bad/absent token must fail fast, never hang the pipeline:
-#   GIT_TERMINAL_PROMPT=0  -> no terminal username/password prompt
-#   GIT_ASKPASS=echo       -> the askpass fallback returns instantly (no dialog)
-#   GCM_INTERACTIVE=never  -> Git Credential Manager won't pop a GUI
-# The osxkeychain/manager helpers, if configured, then just fail to supply a
-# credential and git errors out -- fast and logged, not frozen.
-for _k, _v in (
-    ("GIT_TERMINAL_PROMPT", "0"),
-    ("GIT_ASKPASS", "echo"),
-    ("GCM_INTERACTIVE", "never"),
-):
-    os.environ.setdefault(_k, _v)
-
-from count_merged_prs import (  # noqa: E402
-    list_bitbucket_repos,
-    list_github_repos,
-    list_gitlab_projects,
-)
-from credential_redactor import scrub_secrets  # noqa: E402
-from export_all_merged_prs import (  # noqa: E402
+from analysis.merged_prs import (  # noqa: E402
     CSV_FIELDS,
     SUMMARY_FIELDS,
     export_bitbucket_repos,
@@ -158,8 +151,13 @@ from export_all_merged_prs import (  # noqa: E402
     export_github_repos,
     export_gitlab_group,
     export_gitlab_projects,
+    list_bitbucket_repos,
+    list_github_repos,
+    list_gitlab_projects,
     safe_filename,
 )
+from eval.credential_redactor import scrub_secrets  # noqa: E402
+
 GITHUB_TOKEN_NAME = "github-data-token"
 GITLAB_TOKEN_NAME = "gitlab_token"
 BITBUCKET_TOKEN_NAME = "bitbucket_token"
@@ -168,7 +166,7 @@ BITBUCKET_TOKEN_NAME = "bitbucket_token"
 BITBUCKET_USERNAME_NAME = "bitbucket_username"
 OPENAI_TOKEN_NAMES = ("openai_key", "OPENAI_API_KEY")
 # Azure AI Foundry / Azure OpenAI settings the tokens file may carry; promoted
-# into the environment at startup (see build_run_context validation).
+# into the environment at startup (see preflight).
 AZURE_TOKEN_NAMES = (
     "AZURE_OPENAI_ENDPOINT",
     "AZURE_OPENAI_API_KEY",
@@ -211,9 +209,9 @@ class RunContext:
     merged_pr_dir: Path
     profiler_dir: Path
     eval_kit_dir: Path
-    repo_analyzer_dir: Path
     quality_dir: Path
     task_profile_dir: Path
+    repo_analyzer_dir: Path
     include_quality_score: bool
     logs_dir: Path
     tokens: dict[str, str]
@@ -246,7 +244,7 @@ class PipelineLogger:
     def __init__(self, master_log: Path) -> None:
         self.master_log = master_log
         master_log.parent.mkdir(parents=True, exist_ok=True)
-        self._logger = logging.getLogger("org_pipeline")
+        self._logger = logging.getLogger("org_analyser")
         self._logger.setLevel(logging.INFO)
         if not self._logger.handlers:
             fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -277,6 +275,17 @@ def parse_tokens_file(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         tokens[key.strip()] = value.strip()
     return tokens
+
+
+def resolve_tokens(tokens_file: str | None) -> dict[str, str]:
+    """Tokens come from config.yml's `tokens:` mapping by default. Pass
+    --tokens-file to use a separate key=value file instead (back-compat)."""
+    if tokens_file:
+        path = Path(tokens_file)
+        if not path.is_file():
+            raise SystemExit(f"tokens file not found: {path}")
+        return parse_tokens_file(path)
+    return {str(k): str(v) for k, v in (CONFIG.get("tokens") or {}).items()}
 
 
 def azure_configured() -> bool:
@@ -437,21 +446,6 @@ def discover_local_repos(ctx: RunContext, log: PipelineLogger) -> list[RepoEntry
     if not root or not root.is_dir():
         raise RuntimeError(f"Local repos directory not found: {root}")
 
-    # If the path is itself a repo (has .git), treat it as a single repo rather
-    # than a parent folder of repos. Lets --local-repos-dir accept either.
-    if (root / ".git").exists():
-        full_name = ctx.repos_manifest.get(root.name) or f"local/{root.name}"
-        log.info(f"Local single-repo mode: {root}")
-        return [
-            RepoEntry(
-                platform="local",
-                full_name=full_name,
-                org=ctx.target,
-                batch_org=ctx.target,
-                local_path=root.resolve(),
-            )
-        ]
-
     entries: list[RepoEntry] = []
     for child in sorted(root.iterdir()):
         if not child.is_dir() or child.name.startswith("."):
@@ -474,13 +468,6 @@ def discover_local_repos(ctx: RunContext, log: PipelineLogger) -> list[RepoEntry
 
 def check_tool(name: str) -> bool:
     return shutil.which(name) is not None
-
-
-def _ensure_quality_imports() -> None:
-    for path in (QUALITY_AGENT, SIGNAL_SCORER_DIR):
-        s = str(path)
-        if s not in sys.path:
-            sys.path.insert(0, s)
 
 
 def preflight(ctx: RunContext, log: PipelineLogger) -> None:
@@ -573,14 +560,8 @@ def preflight(ctx: RunContext, log: PipelineLogger) -> None:
     if not ctx.profiler_template.is_file():
         errors.append(f"Profiler template not found: {ctx.profiler_template}")
 
-    if not (EVAL_KIT / "repo_evaluator.py").is_file():
-        errors.append(f"eval-kit not found: {EVAL_KIT / 'repo_evaluator.py'}")
-
-    if not REPO_ANALYZER_SCRIPT.is_file():
-        errors.append(f"repo-analyzer not found: {REPO_ANALYZER_SCRIPT}")
-
-    if not TASK_PROFILE_SCRIPT.is_file():
-        errors.append(f"PR task-profile script not found: {TASK_PROFILE_SCRIPT}")
+    if not (EVAL_ROOT / "repo_evaluator.py").is_file():
+        errors.append(f"eval-kit not found: {EVAL_ROOT / 'repo_evaluator.py'}")
 
     if ctx.include_quality_score:
         if not (QUALITY_SKILL / "scripts" / "score.py").is_file():
@@ -589,13 +570,13 @@ def preflight(ctx: RunContext, log: PipelineLogger) -> None:
     try:
         import openpyxl  # noqa: F401
     except ImportError:
-        errors.append("openpyxl not installed (pip install -r org_pipeline_requirements.txt)")
+        errors.append("openpyxl not installed (pip install -e .)")
 
     for pkg in ("requests", "openai"):
         try:
             __import__(pkg)
         except ImportError:
-            errors.append(f"{pkg} not installed (pip install -r org_pipeline_requirements.txt)")
+            errors.append(f"{pkg} not installed (pip install -e .)")
 
     if errors:
         for err in errors:
@@ -621,8 +602,7 @@ def discover_repos(ctx: RunContext, log: PipelineLogger) -> list[RepoEntry]:
             entries.append(RepoEntry("github", repo, owner, owner))
     elif ctx.platform == "bitbucket":
         token = ctx.tokens[BITBUCKET_TOKEN_NAME]
-        names = list_bitbucket_repos(token, ctx.target,
-                                     ctx.tokens.get(BITBUCKET_USERNAME_NAME, ""))
+        names = list_bitbucket_repos(token, ctx.target, ctx.tokens.get(BITBUCKET_USERNAME_NAME, ""))
         entries = [
             RepoEntry("bitbucket", name, ctx.target, ctx.target) for name in names
         ]
@@ -847,11 +827,54 @@ def run_py(
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
+def run_module(
+    module: str,
+    args: list[str],
+    timeout: int = 900,
+    cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
+    """Run `python -m <module>` (resolves via cwd being on sys.path, no install required).
+
+    Pass secrets through extra_env, never through args: argv is world-readable
+    via `ps` and /proc/<pid>/cmdline.
+    """
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    try:
+        proc = subprocess.run(
+            [PYTHON_BIN, "-m", module, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return 1, "", "timeout"
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
 def stdout_json(stdout: str) -> str:
     text = stdout.lstrip()
     if text.startswith("{"):
         return extract_json(stdout)
     return stdout
+
+
+def run_py_message(
+    script: Path,
+    args: list[str],
+    timeout: int = 900,
+    cwd: Path | None = None,
+) -> tuple[int, str]:
+    """Like run_py but merges stdout/stderr for error reporting."""
+    code, out, err = run_py(script, args, timeout=timeout, cwd=cwd)
+    if code == 0 and out.lstrip().startswith("{"):
+        out = stdout_json(out)
+    combined = out + (f"\n{err}" if err else "")
+    return code, combined
 
 
 def with_retries(
@@ -914,12 +937,7 @@ def run_profiler(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
             originating_company=entry.org,
             repo_name=entry.repo_slug,
         )
-        # Per-repo phases run in a thread pool but every profiler row lands in the
-        # SAME workbook (ctx.profiler_out). openpyxl load→save isn't atomic and an
-        # xlsx is a zip, so concurrent writers corrupt the file (BadZipFile) and,
-        # on Windows, fail outright on the file lock. Serialise the append.
-        with _PROFILER_WRITE_LOCK:
-            append_row(result, template=str(ctx.profiler_template), out=str(ctx.profiler_out))
+        append_row(result, template=str(ctx.profiler_template), out=str(ctx.profiler_out))
         return True, f"profiler ok ({len(result.values)} fields){remote_note}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
@@ -930,7 +948,7 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
     out_dir.mkdir(parents=True, exist_ok=True)
     out_json = out_dir / f"{entry.short_name}.json"
 
-    # The token goes to the child via REPO_EVAL_TOKEN, never on argv (§4.2).
+    # The token goes to the child via REPO_EVAL_TOKEN, never on argv.
     token = ""
     remote_ref = resolve_remote_ref(entry, ctx)
     if remote_ref:
@@ -970,12 +988,12 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         if bb_user:
             extra_env["BITBUCKET_USERNAME"] = bb_user
 
-    code, out, err = run_py(
-        EVAL_KIT / "repo_evaluator.py",
+    code, out, err = run_module(
+        "eval.repo_evaluator",
         args,
         extra_env=extra_env or None,
         timeout=7200,
-        cwd=EVAL_KIT,
+        cwd=CODING,
     )
     if code != 0:
         return False, (out + err)[-2000:]
@@ -995,8 +1013,8 @@ def run_repo_analyzer(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tu
         "--name", entry.full_name,
         "--output", str(out_csv),
     ]
-    code, out, err = run_py(
-        REPO_ANALYZER_SCRIPT,
+    code, out, err = run_module(
+        "analysis.repo_analyzer",
         args,
         timeout=3600,
         cwd=CODING,
@@ -1007,8 +1025,7 @@ def run_repo_analyzer(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tu
 
 
 def run_quality_score(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[bool, str]:
-    _ensure_quality_imports()
-    from agent_rubric_scorer import (  # noqa: WPS433
+    from quality.agent_scorer import (  # noqa: WPS433
         build_scores_json,
         scores_for_seal,
         write_scoring_notes,
@@ -1104,7 +1121,8 @@ def run_pr_task_profile(
         for repo in ctx.github_repos:
             args.extend(["--repo", repo])
     elif ctx.platform in ("bitbucket", "bitbucket-repo"):
-        # pr_task_profile doesn't expand workspaces; pass each discovered repo.
+        # pr_task_profile doesn't expand workspaces itself, so pass each
+        # already-discovered repo.
         for entry in entries:
             args.extend(["--bitbucket-repo", entry.full_name])
     elif ctx.platform == "gitlab":
@@ -1138,7 +1156,7 @@ def run_pr_task_profile(
 
     try:
         proc = subprocess.run(
-            [PYTHON_BIN, str(TASK_PROFILE_SCRIPT), *args],
+            [PYTHON_BIN, "-m", "analysis.pr_task_profile", *args],
             capture_output=True,
             text=True,
             timeout=86400,
@@ -1242,7 +1260,7 @@ def aggregate_quality_org(ctx: RunContext, log: PipelineLogger) -> None:
         log.error(f"Org quality aggregate failed: {(out + err)[-300:]}")
         return
 
-    unwrap = QUALITY_AGENT / "unwrap.py"
+    unwrap = QUALITY_SKILL / "unwrap.py"
     if unwrap.is_file():
         run_py(
             unwrap,
@@ -1303,7 +1321,7 @@ def create_run_zip(run_dir: Path) -> Path:
 
 
 def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> RunContext:
-    tokens = parse_tokens_file(Path(args.tokens_file))
+    tokens = resolve_tokens(args.tokens_file)
     gitlab_projects: list[str] = []
     github_repos: list[str] = []
     bitbucket_repos: list[str] = []
@@ -1372,7 +1390,7 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
         run_label = f"bitbucket-repos-{len(bitbucket_repos)}"
     else:
         run_label = safe_filename(target.replace("/", "_").replace(" ", "_"))
-    run_name = f"org-pipeline-{run_label}-{stamp}"
+    run_name = f"org-analyser-{run_label}-{stamp}"
     output_parent = Path(args.output_dir)
     run_dir = (output_parent / run_name).resolve()
 
@@ -1385,9 +1403,9 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
         merged_pr_dir=run_dir / "merged-pr-counts",
         profiler_dir=run_dir / "codebase-profiler",
         eval_kit_dir=run_dir / "eval-kit",
-        repo_analyzer_dir=run_dir / "repo-analyzer",
         quality_dir=run_dir / "repo-quality-score",
         task_profile_dir=run_dir / "pr-task-profile",
+        repo_analyzer_dir=run_dir / "repo-analyzer",
         include_quality_score=include_quality_score,
         logs_dir=run_dir / "logs",
         tokens=tokens,
@@ -1414,21 +1432,30 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run merged PR counts, PR task-profile, codebase profiler, eval-kit, "
-            "and optionally repo-quality-score for one org/group."
+            "and optionally repo-quality-score for one org/group. Defaults below "
+            "can be set in config.yml at the repo root; CLI flags override it."
         ),
     )
-    target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--github-org", help="GitHub organization to process")
+    target = parser.add_mutually_exclusive_group(required=False)
+    target.add_argument(
+        "--github-org",
+        default=CONFIG.get("github_org"),
+        help="GitHub organization to process",
+    )
     target.add_argument(
         "--github-repo",
         action="append",
         metavar="OWNER/REPO",
         help=(
             "Single GitHub repo path (repeatable, or comma-separated). "
-            "Example: --github-repo data-tech/frontend --github-repo data-tech/backend"
+            "Example: --github-repo your-org/example-repo --github-repo your-org/backend"
         ),
     )
-    target.add_argument("--bitbucket-workspace", help="Bitbucket workspace to process")
+    target.add_argument(
+        "--bitbucket-workspace",
+        default=CONFIG.get("bitbucket_workspace"),
+        help="Bitbucket workspace to process",
+    )
     target.add_argument(
         "--bitbucket-repo",
         action="append",
@@ -1438,86 +1465,137 @@ def parse_args() -> argparse.Namespace:
             "Example: --bitbucket-repo my-team/frontend --bitbucket-repo my-team/backend"
         ),
     )
-    target.add_argument("--gitlab-group", help="GitLab top-level group to process")
+    target.add_argument(
+        "--gitlab-group",
+        default=CONFIG.get("gitlab_group"),
+        help="GitLab top-level group to process",
+    )
     target.add_argument(
         "--gitlab-project",
         action="append",
         metavar="GROUP/PROJECT",
         help=(
             "GitLab project path (repeatable, or comma-separated). "
-            "Example: --gitlab-project my-group/repo-a --gitlab-project my-group/repo-b"
+            "Example: --gitlab-project your-group/repo-a --gitlab-project your-group/repo-b"
         ),
     )
     target.add_argument(
         "--local-repos-dir",
+        default=CONFIG.get("local_repos_dir"),
         help="Directory containing one repo per subfolder (downloaded/local checkouts)",
     )
 
-    parser.add_argument("--tokens-file", default="tokens", help="Path to tokens file")
+    parser.add_argument(
+        "--tokens-file",
+        default=CONFIG.get("tokens_file"),
+        help="Optional key=value tokens file. Default: read the `tokens:` "
+        "mapping from config.yml instead.",
+    )
     parser.add_argument(
         "--repos-manifest",
+        default=CONFIG.get("repos_manifest"),
         help="Optional JSON map of folder_name -> owner/repo (or gitlab:group/repo) "
         "for API-backed PR analysis on local clones",
     )
     parser.add_argument(
         "--local-batch-name",
-        default="local",
+        default=CONFIG.get("local_batch_name", "local"),
         help="Batch label for local runs (output paths and run folder name)",
     )
     parser.add_argument(
         "--output-dir",
-        default=str(CODING / "outputs" / "org-pipeline-runs"),
+        default=CONFIG.get("output_dir", str(CODING / "outputs" / "org-analyser-runs")),
         help="Parent directory for timestamped run folders",
     )
-    parser.add_argument("--workers", type=int, default=10, help="Parallel repo workers")
-    parser.add_argument("--retries", type=int, default=3, help="Retries per repo per phase")
+    parser.add_argument(
+        "--workers", type=int, default=CONFIG.get("workers", 10), help="Parallel repo workers"
+    )
+    parser.add_argument(
+        "--retries", type=int, default=CONFIG.get("retries", 3), help="Retries per repo per phase"
+    )
     parser.add_argument(
         "--retention-days",
         type=int,
-        default=90,
+        default=CONFIG.get("retention_days", 90),
         help="Delete run folders older than this many days before starting "
-             "(run bundles contain contributor data; 0 disables the sweep)",
+        "(run bundles contain contributor data; 0 disables the sweep)",
     )
     parser.add_argument(
         "--clone-depth",
         type=int,
-        default=0,
+        default=CONFIG.get("clone_depth", 0),
         help="Git clone depth (0 = full clone, default)",
+    )
+    parser.add_argument("--github-host", default=CONFIG.get("github_host", "github.com"))
+    parser.add_argument("--gitlab-host", default=CONFIG.get("gitlab_host", "gitlab.com"))
+    parser.add_argument(
+        "--github-token-name",
+        default=CONFIG.get("github_token_name", GITHUB_TOKEN_NAME),
+        help=f"Key in tokens file for GitHub API (default: {GITHUB_TOKEN_NAME})",
+    )
+    parser.add_argument(
+        "--skip-quality-score",
+        action="store_true",
+        default=bool(CONFIG.get("skip_quality_score", False)),
+        help="Skip the repo-quality-score phase and sealed-JSON org rollup",
     )
     parser.add_argument(
         "--skip-f2p",
         action="store_true",
+        default=bool(CONFIG.get("skip_f2p", False)),
         help="Skip F2P/P2P test verification in eval-kit (the slowest phase: it "
-             "installs deps and runs the test suite per accepted PR). Recommended "
-             "for large repos.",
+        "installs deps and runs the test suite per accepted PR). Recommended "
+        "for large repos.",
     )
     parser.add_argument(
         "--local-only",
         action="store_true",
+        default=bool(CONFIG.get("local_only", False)),
         help="Never contact a remote API. Runs only the code-based analyses on "
-             "local checkouts and skips PR-based phases, even if a checkout still "
-             "has an 'origin' remote. Auto-enabled with --local-repos-dir when no "
-             "token is available.",
+        "local checkouts and skips PR-based phases, even if a checkout still "
+        "has an 'origin' remote. Auto-enabled with --local-repos-dir when no "
+        "token is available.",
     )
-    parser.add_argument("--github-host", default="github.com")
-    parser.add_argument("--gitlab-host", default="gitlab.com")
-    parser.add_argument(
-        "--github-token-name",
-        default=GITHUB_TOKEN_NAME,
-        help=f"Key in tokens file for GitHub API (default: {GITHUB_TOKEN_NAME})",
-    )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # action="append" defaults can't be set on the argument itself (argparse would
+    # extend rather than replace them on CLI use), so fall back to config here.
+    if not args.github_repo and CONFIG.get("github_repo"):
+        args.github_repo = list(CONFIG["github_repo"])
+    if not args.bitbucket_repo and CONFIG.get("bitbucket_repo"):
+        args.bitbucket_repo = list(CONFIG["bitbucket_repo"])
+    if not args.gitlab_project and CONFIG.get("gitlab_project"):
+        args.gitlab_project = list(CONFIG["gitlab_project"])
+
+    if not any(
+        [
+            args.github_org,
+            args.github_repo,
+            args.bitbucket_workspace,
+            args.bitbucket_repo,
+            args.gitlab_group,
+            args.gitlab_project,
+            args.local_repos_dir,
+        ]
+    ):
+        parser.error(
+            "one target required: --github-org, --github-repo, --bitbucket-workspace, "
+            "--bitbucket-repo, --gitlab-group, --gitlab-project, or --local-repos-dir "
+            "(or set one in config.yml)"
+        )
+    return args
 
 
-def run_pipeline(include_quality_score: bool = True) -> int:
+def run_pipeline() -> int:
     args = parse_args()
+    include_quality_score = not args.skip_quality_score
     ctx = build_run_context(args, include_quality_score=include_quality_score)
     ctx.run_dir.mkdir(parents=True, exist_ok=True)
     ctx.profiler_dir.mkdir(parents=True, exist_ok=True)
 
     log = PipelineLogger(ctx.pipeline_log)
     started = datetime.now(timezone.utc).isoformat()
-    log.info(f"Starting org pipeline: {ctx.platform}={ctx.target}")
+    log.info(f"Starting org-analyser: {ctx.platform}={ctx.target}")
     log.info(f"Include repo-quality-score: {ctx.include_quality_score}")
     if ctx.local_only:
         log.info("Local-only mode: code-based analyses only, PR/remote phases skipped.")
@@ -1630,5 +1708,9 @@ def run_pipeline(include_quality_score: bool = True) -> int:
         return 1
 
 
+def main() -> int:
+    return run_pipeline()
+
+
 if __name__ == "__main__":
-    raise SystemExit(run_pipeline(include_quality_score=True))
+    raise SystemExit(main())
