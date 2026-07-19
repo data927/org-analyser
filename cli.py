@@ -40,12 +40,14 @@ import time
 import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 import certifi
+from rich.console import Console
 
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
@@ -127,17 +129,22 @@ def git_longpath_config() -> list[str]:
 
 
 def resolve_clones_dir(run_dir: Path) -> Path:
-    """Pick a clone root that stays under Windows MAX_PATH limits."""
-    nested = run_dir / "clones"
-    if os.name != "nt":
-        return nested
-    # Deep run folders (e.g. under Downloads) exceed git's GIT_DIR limit on Windows.
-    base = Path(
-        os.environ.get("LOCALAPPDATA")
-        or os.environ.get("TEMP")
-        or "C:\\Temp"
-    )
-    return base / "org-analyser-clones" / run_dir.name
+    """Clones always live outside run_dir, on every OS.
+
+    This makes clone/source-code inclusion in the final zip structurally
+    impossible (create_run_zip refuses to run if clones_dir is ever inside
+    run_dir) rather than relying on a by-name skip list. On Windows this also
+    doubles as the MAX_PATH workaround -- deep run folders (e.g. under
+    Downloads) exceed git's GIT_DIR limit.
+    """
+    if os.name == "nt":
+        base = Path(
+            os.environ.get("LOCALAPPDATA")
+            or os.environ.get("TEMP")
+            or "C:\\Temp"
+        )
+        return base / "org-analyser-clones" / run_dir.name
+    return run_dir.parent / ".org-analyser-clones" / run_dir.name
 
 
 sys.path.insert(0, str(CODING))
@@ -157,6 +164,14 @@ from analysis.merged_prs import (  # noqa: E402
     safe_filename,
 )
 from llm.credential_redactor import scrub_secrets  # noqa: E402
+from llm.tree_redactor import redact_working_tree, write_redaction_report  # noqa: E402
+from pipeline.progress import RunProgress, rich_console_handler, should_use_rich  # noqa: E402
+from pipeline.state import (  # noqa: E402
+    DONE_STATUSES,
+    FAILED,
+    OK,
+    StateStore,
+)
 from platforms.bitbucket import resolve_bitbucket_git_auth  # noqa: E402
 
 GITHUB_TOKEN_NAME = "github-data-token"
@@ -236,6 +251,9 @@ class RunContext:
     profiler_out: Path
     manifest: dict[str, Any] = field(default_factory=dict)
     pipeline_log: Path = field(default_factory=Path)
+    state: "StateStore | None" = None
+    run_id: int = 0
+    generation: int = 1
 
     def repo_log_dir(self, entry: RepoEntry) -> Path:
         return self.logs_dir / entry.platform / entry.batch_org / entry.short_name
@@ -245,10 +263,19 @@ class RunContext:
 
 
 class PipelineLogger:
-    def __init__(self, master_log: Path) -> None:
+    """Full detail always goes to master_log. Console output is INFO-level
+    (every line) by default; --quiet raises the console handler to WARNING
+    so a CI log shows only the start line, the final summary, errors, and
+    where to find failures/resume -- everything else still lands in the
+    file, nothing is lost, stdout just stops being a mirror of it.
+    """
+
+    def __init__(self, master_log: Path, quiet: bool = False) -> None:
         self.master_log = master_log
+        self._quiet = quiet
         master_log.parent.mkdir(parents=True, exist_ok=True)
         self._logger = logging.getLogger("org_analyser")
+        self.logger = self._logger  # public handle, e.g. for pipeline.progress's handler swap
         self._logger.setLevel(logging.INFO)
         if not self._logger.handlers:
             fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -256,11 +283,20 @@ class PipelineLogger:
             fh.setFormatter(fmt)
             sh = logging.StreamHandler(sys.stdout)
             sh.setFormatter(fmt)
+            sh.setLevel(logging.WARNING if quiet else logging.INFO)
             self._logger.addHandler(fh)
             self._logger.addHandler(sh)
 
     def info(self, msg: str) -> None:
         self._logger.info(msg)
+
+    def important(self, msg: str) -> None:
+        """Like info(), but always reaches stdout even under --quiet --
+        reserved for the handful of lines someone watching a CI log
+        actually needs: start, final summary, failures/resume pointers."""
+        self._logger.info(msg)
+        if self._quiet:
+            print(msg)
 
     def error(self, msg: str) -> None:
         self._logger.error(msg)
@@ -730,6 +766,23 @@ def clone_url(entry: RepoEntry, tokens: dict[str, str], ctx: RunContext) -> str:
     return f"{host}/{entry.full_name}.git"
 
 
+def copy_local_repo(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | None]:
+    """Local repos are never analysed in the user's actual checkout -- copied
+    into the disposable clones area first, exactly like a remote clone, so
+    the redact phase (which rewrites files in place) can never touch the
+    user's real source tree."""
+    src = entry.local_path
+    dest = ctx.clone_path(entry)
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copytree(src, dest, symlinks=True)
+    except OSError as exc:
+        return False, f"copy of local checkout failed: {exc}", None
+    return True, f"copied local checkout {src} -> {dest}", dest
+
+
 def fresh_clone(entry: RepoEntry, ctx: RunContext) -> tuple[bool, str, Path | None]:
     dest = ctx.clone_path(entry)
     if dest.exists():
@@ -900,6 +953,30 @@ def with_retries(
         if attempt < retries:
             time.sleep(min(30, 2 ** attempt))
     return False, last_err, attempts
+
+
+def run_redact(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[bool, str]:
+    """Scrub secrets from the working tree in place, right after clone and
+    before any phase below reads the tree. A hard gate: process_repo refuses
+    to run codebase-profiler/repo-analyzer/eval-kit/repo-quality-score unless
+    this phase is 'ok' in the state DB for this repo."""
+    try:
+        report = redact_working_tree(clone_path)
+        out_dir = ctx.repo_log_dir(entry)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_redaction_report(report, out_dir / "redaction_report.json")
+        total_secrets = sum(report.get("secrets_by_type", {}).values())
+        detail = (
+            f"redact ok: files_scanned={report['files_scanned']} "
+            f"files_modified={report['files_modified']} "
+            f"key_files_dropped={report['files_dropped']} "
+            f"secrets_redacted={total_secrets} by_type={report['secrets_by_type']}"
+        )
+        if report["errors"]:
+            detail += f" errors={report['errors'][:5]}"
+        return True, detail
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
 
 
 def run_profiler(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[bool, str]:
@@ -1198,6 +1275,42 @@ def run_pr_task_profile(
     return result
 
 
+# Order matters: each phase's output depends on the working tree state left
+# by the one before it. Used to invalidate everything downstream of a phase
+# that gets redone from scratch (a fresh reclone, or an explicit
+# `retry --force`) -- see _invalidate_downstream and retry_command.
+REPO_PHASE_CHAIN = [
+    "clone",
+    "redact",
+    "codebase-profiler",
+    "repo-analyzer",
+    "eval-kit",
+    "repo-quality-score",
+]
+
+
+def _clone_is_valid(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _invalidate_downstream(state: StateStore, run_id: int, repo: str, from_phase: str) -> None:
+    if from_phase not in REPO_PHASE_CHAIN:
+        return
+    for phase in REPO_PHASE_CHAIN[REPO_PHASE_CHAIN.index(from_phase) + 1 :]:
+        state.reset_phase(run_id, phase, repo, force=True)
+
+
 def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict[str, Any]:
     repo_log = ctx.repo_log_dir(entry)
     status: dict[str, Any] = {
@@ -1206,33 +1319,148 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
         "short_name": entry.short_name,
         "phases": {},
     }
+    secrets_to_scrub = [
+        ctx.tokens.get(ctx.github_token_name, ""),
+        ctx.tokens.get(GITLAB_TOKEN_NAME, ""),
+        ctx.tokens.get(BITBUCKET_TOKEN_NAME, ""),
+    ]
+
+    def phase_log_path(phase: str) -> str:
+        return str(repo_log / f"{phase}.log")
 
     def record(phase: str, ok: bool, detail: str, attempts: int) -> None:
+        clean = scrub_secrets(detail, *secrets_to_scrub)
         status["phases"][phase] = {
             "ok": ok,
             "attempts": attempts,
-            "detail": detail[-1000:],
+            "detail": clean[-1000:],
         }
-        log.phase_log(repo_log / f"{phase}.log", detail)
+        log.phase_log(repo_log / f"{phase}.log", clean)
 
-    # Clone (skipped for local repos — use existing checkout)
-    if entry.is_local and entry.local_path:
-        clone_path = entry.local_path
-        status["repo_path"] = str(clone_path)
-        record("clone", True, f"using local path {clone_path}", 1)
-    else:
-        def do_clone() -> tuple[bool, str]:
-            ok, msg, path = fresh_clone(entry, ctx)
-            if ok and path:
-                status["clone_path"] = str(path)
-            return ok, msg
-
-        ok, detail, attempts = with_retries(do_clone, ctx.retries, "clone")
-        record("clone", ok, detail, attempts)
+    def run_tracked(
+        phase: str, fn: Callable[[], tuple[bool, str]], retries: int | None = None
+    ) -> bool:
+        """Skip if already ok (resume); else run with retries, write-through to
+        the state DB before and after so a crash mid-phase leaves a durable
+        'running' row instead of silence."""
+        if ctx.state.repo_phase_status(ctx.run_id, entry.full_name, phase) in DONE_STATUSES:
+            status["phases"][phase] = {
+                "ok": True,
+                "attempts": 0,
+                "detail": "skipped (resume: already ok)",
+            }
+            return True
+        attempt_no = ctx.state.start_repo_phase(
+            ctx.run_id, entry.full_name, entry.platform, phase, ctx.generation
+        )
+        t0 = time.monotonic()
+        ok, detail, attempts = with_retries(
+            fn, retries if retries is not None else ctx.retries, phase
+        )
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        record(phase, ok, detail, attempts)
+        ctx.state.finish_repo_phase(
+            ctx.run_id,
+            entry.full_name,
+            phase,
+            ctx.generation,
+            ok,
+            error=detail if not ok else "",
+            log_path=phase_log_path(phase),
+            duration_ms=duration_ms,
+            attempt=attempt_no,
+        )
         if not ok:
-            status["overall"] = "failed"
-            return status
-        clone_path = ctx.clone_path(entry)
+            log.info(f"  {entry.full_name}: {phase} failed after {attempts} attempt(s)")
+        return ok
+
+    # ---- clone. Local repos are copied into the disposable clones area
+    # rather than analysed in place -- the redact phase rewrites files, and
+    # that must never happen to the user's actual --local-repos-dir checkout. ----
+    clone_path: Path
+    if entry.is_local and entry.local_path:
+        status["repo_path"] = str(entry.local_path)
+        target_path = ctx.clone_path(entry)
+        prior_clone_ok = ctx.state.repo_phase_status(ctx.run_id, entry.full_name, "clone") == OK
+        if prior_clone_ok and target_path.is_dir() and any(target_path.iterdir()):
+            clone_path = target_path
+            record(
+                "clone", True, f"reusing existing local copy from a previous run: {clone_path}", 1
+            )
+        else:
+            attempt_no = ctx.state.start_repo_phase(
+                ctx.run_id, entry.full_name, entry.platform, "clone", ctx.generation
+            )
+            t0 = time.monotonic()
+            ok, detail, _copied_path = copy_local_repo(entry, ctx)
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            record("clone", ok, detail, 1)
+            ctx.state.finish_repo_phase(
+                ctx.run_id,
+                entry.full_name,
+                "clone",
+                ctx.generation,
+                ok,
+                error=detail if not ok else "",
+                clone_path=str(target_path) if ok else "",
+                log_path=phase_log_path("clone"),
+                duration_ms=duration_ms,
+                attempt=attempt_no,
+            )
+            if not ok:
+                status["overall"] = "failed"
+                return status
+            clone_path = target_path
+            _invalidate_downstream(ctx.state, ctx.run_id, entry.full_name, "clone")
+    else:
+        target_path = ctx.clone_path(entry)
+        prior_clone_ok = ctx.state.repo_phase_status(ctx.run_id, entry.full_name, "clone") == OK
+        if prior_clone_ok and _clone_is_valid(target_path):
+            clone_path = target_path
+            record("clone", True, f"reusing existing clone from a previous run: {clone_path}", 1)
+        else:
+            attempt_no = ctx.state.start_repo_phase(
+                ctx.run_id, entry.full_name, entry.platform, "clone", ctx.generation
+            )
+            t0 = time.monotonic()
+
+            def do_clone() -> tuple[bool, str]:
+                ok, msg, path = fresh_clone(entry, ctx)
+                if ok and path:
+                    status["clone_path"] = str(path)
+                return ok, msg
+
+            ok, detail, attempts = with_retries(do_clone, ctx.retries, "clone")
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            record("clone", ok, detail, attempts)
+            ctx.state.finish_repo_phase(
+                ctx.run_id,
+                entry.full_name,
+                "clone",
+                ctx.generation,
+                ok,
+                error=detail if not ok else "",
+                clone_path=str(target_path) if ok else "",
+                log_path=phase_log_path("clone"),
+                duration_ms=duration_ms,
+                attempt=attempt_no,
+            )
+            if not ok:
+                status["overall"] = "failed"
+                return status
+            clone_path = target_path
+            # A fresh clone invalidates whatever the prior generation computed
+            # from the old working tree -- without this, resume would skip
+            # redact/analysis phases as "ok" against a tree that no longer
+            # exists (this repo's very first clone is a no-op here: nothing
+            # to invalidate yet).
+            _invalidate_downstream(ctx.state, ctx.run_id, entry.full_name, "clone")
+
+    # ---- redact: hard gate. No analysis phase below may read the tree
+    # until this is ok for this repo. ----
+    if not run_tracked("redact", lambda: run_redact(entry, clone_path, ctx)):
+        status["overall"] = "failed"
+        return status
 
     repo_phases: list[tuple[str, Callable[[], tuple[bool, str]]]] = [
         ("codebase-profiler", lambda: run_profiler(entry, clone_path, ctx)),
@@ -1245,10 +1473,7 @@ def process_repo(entry: RepoEntry, ctx: RunContext, log: PipelineLogger) -> dict
         )
 
     for phase_name, fn in repo_phases:
-        ok, detail, attempts = with_retries(fn, ctx.retries, phase_name)
-        record(phase_name, ok, detail, attempts)
-        if not ok:
-            log.info(f"  {entry.full_name}: {phase_name} failed after {attempts} attempt(s)")
+        run_tracked(phase_name, fn)
 
     phase_ok = all(p.get("ok") for p in status["phases"].values())
     status["overall"] = "ok" if phase_ok else "partial"
@@ -1318,22 +1543,50 @@ def remove_clones(ctx: RunContext, log: PipelineLogger) -> None:
         log.error(f"Failed to remove clones directory: {exc}")
 
 
-def create_run_zip(run_dir: Path) -> Path:
+def create_run_zip(run_dir: Path, clones_dir: Path) -> Path:
+    """Zip everything under run_dir. Clone source code must never end up in
+    here -- enforced structurally (clones_dir lives outside run_dir, see
+    resolve_clones_dir) and then verified twice: a precondition before
+    writing anything, and a scan of the finished archive for .git/ entries.
+    """
+    run_dir_resolved = run_dir.resolve()
+    clones_resolved = clones_dir.resolve()
+    if clones_resolved == run_dir_resolved or clones_resolved.is_relative_to(run_dir_resolved):
+        raise RuntimeError(
+            f"refusing to zip: clones_dir ({clones_resolved}) is inside run_dir "
+            f"({run_dir_resolved}) -- source code would leak into the deliverable"
+        )
+
     zip_name = f"{run_dir.name}.zip"
     zip_path = run_dir / zip_name
-    skip_top_dirs = {"clones"}
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(run_dir.rglob("*")):
             if not path.is_file() or path == zip_path:
                 continue
             rel = path.relative_to(run_dir)
-            if rel.parts and rel.parts[0] in skip_top_dirs:
+            if ".git" in rel.parts:
                 continue
             zf.write(path, rel)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in zf.namelist():
+            if ".git/" in name.replace("\\", "/"):
+                raise RuntimeError(f"zip safety violation: .git path in bundle: {name}")
     return zip_path
 
 
-def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> RunContext:
+def build_run_context(
+    args: argparse.Namespace,
+    include_quality_score: bool,
+    run_dir_override: Path | None = None,
+) -> RunContext:
+    """Derive a RunContext from parsed args.
+
+    run_dir_override forces a specific run directory instead of minting a new
+    timestamped one -- used by `resume`/`retry`, which replay the exact args
+    stored in state.db against the original run_dir so every derived path
+    (clones_dir, logs_dir, etc.) comes out identical to the first run.
+    """
     tokens = resolve_tokens(args.tokens_file)
     gitlab_projects: list[str] = []
     github_repos: list[str] = []
@@ -1394,18 +1647,21 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
     # credentials.
     local_only = args.local_only or (platform == "local" and not repos_manifest)
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    if platform == "gitlab-project" and len(gitlab_projects) > 1:
-        run_label = f"gitlab-projects-{len(gitlab_projects)}"
-    elif platform == "github-repo" and len(github_repos) > 1:
-        run_label = f"github-repos-{len(github_repos)}"
-    elif platform == "bitbucket-repo" and len(bitbucket_repos) > 1:
-        run_label = f"bitbucket-repos-{len(bitbucket_repos)}"
+    if run_dir_override is not None:
+        run_dir = run_dir_override.resolve()
     else:
-        run_label = safe_filename(target.replace("/", "_").replace(" ", "_"))
-    run_name = f"org-analyser-{run_label}-{stamp}"
-    output_parent = Path(args.output_dir)
-    run_dir = (output_parent / run_name).resolve()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        if platform == "gitlab-project" and len(gitlab_projects) > 1:
+            run_label = f"gitlab-projects-{len(gitlab_projects)}"
+        elif platform == "github-repo" and len(github_repos) > 1:
+            run_label = f"github-repos-{len(github_repos)}"
+        elif platform == "bitbucket-repo" and len(bitbucket_repos) > 1:
+            run_label = f"bitbucket-repos-{len(bitbucket_repos)}"
+        else:
+            run_label = safe_filename(target.replace("/", "_").replace(" ", "_"))
+        run_name = f"org-analyser-{run_label}-{stamp}"
+        output_parent = Path(args.output_dir)
+        run_dir = (output_parent / run_name).resolve()
 
     profiler_template = PROFILER_ROOT / "codebase_sheet.xlsx"
     return RunContext(
@@ -1442,14 +1698,14 @@ def build_run_context(args: argparse.Namespace, include_quality_score: bool) -> 
     )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run merged PR counts, PR task-profile, codebase profiler, eval-kit, "
-            "and optionally repo-quality-score for one org/group. Defaults below "
-            "can be set in config.yml at the repo root; CLI flags override it."
-        ),
-    )
+def add_run_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add every `run`/`check` flag to `parser`.
+
+    Shared between the `run` and `check` subparsers (check needs the same
+    target/token/host configuration to know what to validate) and, for
+    backward compatibility, the implicit top-level parser used when no
+    subcommand is given at all (see main()).
+    """
     target = parser.add_mutually_exclusive_group(required=False)
     target.add_argument(
         "--github-org",
@@ -1578,8 +1834,19 @@ def parse_args() -> argparse.Namespace:
         "has an 'origin' remote. Auto-enabled with --local-repos-dir when no "
         "token is available.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        default=bool(CONFIG.get("quiet", False)),
+        help="Console shows only the start line, final summary, and errors -- "
+        "everything else still goes to the run's pipeline.log. Recommended for CI.",
+    )
 
+def finalize_run_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> argparse.Namespace:
+    """Post-parse normalization + validation shared by `run` and `check`."""
     # action="append" defaults can't be set on the argument itself (argparse would
     # extend rather than replace them on CLI use), so fall back to config here.
     if not args.github_repo and CONFIG.get("github_repo"):
@@ -1608,6 +1875,65 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+DEFAULT_OUTPUT_DIR = CONFIG.get("output_dir", str(CODING / "outputs" / "org-analyser-runs"))
+COMMANDS = ("run", "resume", "status", "retry", "check")
+
+
+def build_top_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="org-analyser",
+        description=(
+            "Run (or resume, inspect, retry) the merged PR counts / PR task-profile / "
+            "codebase profiler / eval-kit / repo-quality-score pipeline for one org/group. "
+            "Defaults for `run`/`check` can be set in config.yml; CLI flags override it."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    run_p = sub.add_parser("run", help="Run the pipeline (default when no subcommand is given)")
+    add_run_arguments(run_p)
+
+    check_p = sub.add_parser(
+        "check", help="Deep preflight only: verify credentials, tools, and quota, then exit"
+    )
+    add_run_arguments(check_p)
+
+    resume_p = sub.add_parser(
+        "resume", help="Resume the latest (or a given) incomplete run at its failed/pending phases"
+    )
+    resume_p.add_argument(
+        "run_dir", nargs="?", default=None, help="Run directory to resume (default: most recent)"
+    )
+    resume_p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    resume_p.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="Console shows only the start line, final summary, and errors. Recommended for CI.",
+    )
+
+    status_p = sub.add_parser("status", help="Show phase-by-phase status for a run")
+    status_p.add_argument("run_dir", nargs="?", default=None)
+    status_p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    status_p.add_argument("--repo", default=None, help="Show the full event trace for one repo")
+    status_p.add_argument(
+        "--failures", action="store_true", help="Show only failed/interrupted phases"
+    )
+
+    retry_p = sub.add_parser("retry", help="Re-run specific phases/repos of a run")
+    retry_p.add_argument("run_dir", nargs="?", default=None)
+    retry_p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    retry_p.add_argument(
+        "--phase", default=None, help="Only this phase (an org phase name, or any repo phase)"
+    )
+    retry_p.add_argument("--repo", default=None, help="Only this repo (full_name as in status)")
+    retry_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even if already ok, and invalidate phases that depend on it",
+    )
+
+    return parser
+
+
 def print_transparency_banner(local_only: bool) -> None:
     lines = [
         "org-analyser — what this run does with your data:",
@@ -1625,38 +1951,97 @@ def print_transparency_banner(local_only: bool) -> None:
     print("\n".join(lines), file=sys.stderr)
 
 
-def run_pipeline() -> int:
-    args = parse_args()
-    print_transparency_banner(args.local_only)
-    include_quality_score = not args.skip_quality_score
-    ctx = build_run_context(args, include_quality_score=include_quality_score)
-    ctx.run_dir.mkdir(parents=True, exist_ok=True)
-    ctx.profiler_dir.mkdir(parents=True, exist_ok=True)
+def run_org_phase(
+    ctx: RunContext, log: PipelineLogger, phase: str, fn: Callable[[], dict[str, Any]]
+) -> dict[str, Any]:
+    """Run one org-level phase (merged-pr-counts, pr-task-profile) with the
+    same DB write-through and resume-skip as per-repo phases -- and,
+    critically, isolated: an unhandled exception here used to abort the
+    entire pipeline before a single repo was processed. It now always
+    degrades to a recorded failure while discovery and the repo pool
+    continue."""
+    if ctx.state.org_phase_status(ctx.run_id, phase) in DONE_STATUSES:
+        log.info(f"Skip {phase} (already ok from a previous run)")
+        ctx.state.record_event(ctx.run_id, ctx.generation, "org", None, phase, "skipped-resume")
+        return {"skipped": True, "reason": "already ok"}
 
-    log = PipelineLogger(ctx.pipeline_log)
-    started = datetime.now(timezone.utc).isoformat()
-    log.info(f"Starting org-analyser: {ctx.platform}={ctx.target}")
+    attempt = ctx.state.start_org_phase(ctx.run_id, phase, ctx.generation)
+    t0 = time.monotonic()
+    try:
+        result = fn()
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        detail = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        ctx.state.finish_org_phase(
+            ctx.run_id, phase, ctx.generation, False, error=detail,
+            duration_ms=duration_ms, attempt=attempt,
+        )
+        log.error(f"{phase} failed (isolated -- pipeline continues): {exc}")
+        return {"ok": False, "error": str(exc)}
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    ok = not (isinstance(result, dict) and result.get("ok") is False)
+    error = result.get("error", "") if isinstance(result, dict) else ""
+    ctx.state.finish_org_phase(
+        ctx.run_id, phase, ctx.generation, ok, error=str(error),
+        duration_ms=duration_ms, attempt=attempt,
+    )
+    return result
+
+
+def write_failures_report(ctx: RunContext, log: PipelineLogger) -> Path | None:
+    failures = ctx.state.failures(ctx.run_id)
+    if not failures:
+        return None
+    lines = [f"# Failures -- {ctx.platform}:{ctx.target}", ""]
+    for row in failures:
+        header = row["phase"] if row["scope"] == "org" else f"{row['repo']}  {row['phase']}"
+        lines.append(f"## {header}")
+        lines.append(f"- status: {row['status']}, attempts: {row['attempts']}")
+        lines.append(f"- log: {row['log_path'] or '(no log)'}")
+        error_tail = "\n".join((row["error"] or "").strip().splitlines()[-8:])
+        if error_tail:
+            lines.append("```")
+            lines.append(error_tail)
+            lines.append("```")
+        lines.append("")
+    lines.append(f"Resume with: org-analyser resume {ctx.run_dir}")
+    report_path = ctx.run_dir / "FAILURES.md"
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    log.info(f"Failures report: {report_path}")
+    return report_path
+
+
+def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLogger) -> int:
+    """Core pipeline body shared by a fresh `run` and a `resume` -- the only
+    difference between the two is how ctx.state/run_id/generation got set up
+    before this is called. Every phase inside checks the state DB first and
+    skips anything already 'ok', so calling this twice on the same run_dir
+    (i.e. resuming) never repeats completed work."""
+    log.important(f"Starting org-analyser: {ctx.platform}={ctx.target} (generation {ctx.generation})")
     log.info(f"Include repo-quality-score: {ctx.include_quality_score}")
     if ctx.local_only:
         log.info("Local-only mode: code-based analyses only, PR/remote phases skipped.")
     log.info(f"Python: {PYTHON_BIN}")
     log.info(f"Run directory: {ctx.run_dir}")
-    if ctx.clones_dir != ctx.run_dir / "clones":
-        log.info(f"Clones directory (short path): {ctx.clones_dir}")
+    log.info(f"Clones directory (outside run_dir): {ctx.clones_dir}")
 
     prune_old_runs(ctx.run_dir.parent, args.retention_days, log)
 
-    ctx.manifest = {
-        "started_at": started,
-        "platform": ctx.platform,
-        "target": ctx.target,
-        "workers": ctx.workers,
-        "retries": ctx.retries,
-        "clone_depth": ctx.clone_depth,
-        "include_quality_score": ctx.include_quality_score,
-        "repos": [],
-        "phases": {},
-    }
+    ctx.manifest.setdefault("started_at", datetime.now(timezone.utc).isoformat())
+    ctx.manifest.update(
+        {
+            "platform": ctx.platform,
+            "target": ctx.target,
+            "workers": ctx.workers,
+            "retries": ctx.retries,
+            "clone_depth": ctx.clone_depth,
+            "include_quality_score": ctx.include_quality_score,
+            "generation": ctx.generation,
+        }
+    )
+    ctx.manifest.setdefault("repos", [])
+    ctx.manifest.setdefault("phases", {})
     if ctx.platform == "local":
         ctx.manifest["local_repos_dir"] = str(ctx.local_repos_dir)
         if ctx.repos_manifest:
@@ -1671,22 +2056,55 @@ def run_pipeline() -> int:
         entries = discover_repos(ctx, log)
         ctx.manifest["repo_count"] = len(entries)
 
-        if ctx.platform == "local":
-            log.info("Phase 1: merged PR counts skipped (local mode)")
-            ctx.manifest["phases"]["merged-pr-counts"] = {"skipped": True, "reason": "local mode"}
-        else:
-            pr_summary = run_merged_pr_counts(ctx, log)
-            ctx.manifest["phases"]["merged-pr-counts"] = pr_summary
-
-        task_profile_summary = run_pr_task_profile(ctx, log, entries)
-        ctx.manifest["phases"]["pr-task-profile"] = task_profile_summary
-
-        log.info(f"Per-repo phases: processing {len(entries)} repos with {ctx.workers} workers")
+        # merged-pr-counts and pr-task-profile hit the same hosting APIs the
+        # repo pool clones from, but need none of the clones themselves --
+        # nothing here depends on nothing the repo pool produces, so all three
+        # lanes run concurrently instead of the old sequential
+        # merged-pr-counts -> pr-task-profile -> repo-pool chain (pr-task-profile
+        # alone has a 24h timeout; blocking the repo pool behind it was the
+        # single biggest wall-clock cost in the old pipeline).
+        log.info(
+            f"Per-repo phases: processing {len(entries)} repos with {ctx.workers} workers "
+            "(running alongside merged-pr-counts/pr-task-profile)"
+        )
         repo_results: list[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=ctx.workers) as pool:
-            futures = {pool.submit(process_repo, e, ctx, log): e for e in entries}
-            for i, fut in enumerate(as_completed(futures), 1):
-                entry = futures[fut]
+        use_rich = should_use_rich(args.quiet)
+        console = Console() if use_rich else None
+        progress_ui: RunProgress | None = None
+
+        with ExitStack() as stack:
+            if use_rich:
+                stack.enter_context(rich_console_handler(log.logger, console))
+                progress_ui = stack.enter_context(RunProgress(console, len(entries)))
+            org_pool = stack.enter_context(ThreadPoolExecutor(max_workers=2))
+            repo_pool = stack.enter_context(ThreadPoolExecutor(max_workers=ctx.workers))
+
+            org_futures: dict[str, Any] = {}
+            if ctx.platform == "local":
+                log.info("merged-pr-counts skipped (local mode)")
+                ctx.manifest["phases"]["merged-pr-counts"] = {
+                    "skipped": True,
+                    "reason": "local mode",
+                }
+            else:
+                if progress_ui:
+                    progress_ui.start_org_phase("merged-pr-counts")
+                org_futures["merged-pr-counts"] = org_pool.submit(
+                    run_org_phase, ctx, log, "merged-pr-counts", lambda: run_merged_pr_counts(ctx, log)
+                )
+            if progress_ui:
+                progress_ui.start_org_phase("pr-task-profile")
+            org_futures["pr-task-profile"] = org_pool.submit(
+                run_org_phase,
+                ctx,
+                log,
+                "pr-task-profile",
+                lambda: run_pr_task_profile(ctx, log, entries),
+            )
+
+            repo_futures = {repo_pool.submit(process_repo, e, ctx, log): e for e in entries}
+            for i, fut in enumerate(as_completed(repo_futures), 1):
+                entry = repo_futures[fut]
                 try:
                     result = fut.result()
                 except Exception as exc:
@@ -1699,43 +2117,93 @@ def run_pipeline() -> int:
                     }
                 repo_results.append(result)
                 ok_count = sum(1 for r in repo_results if r.get("overall") == "ok")
-                if i % 5 == 0 or i == len(entries):
+                if progress_ui:
+                    partial_count = sum(1 for r in repo_results if r.get("overall") == "partial")
+                    failed_count = sum(1 for r in repo_results if r.get("overall") in ("failed", "error"))
+                    progress_ui.advance_repo(i, ok_count, partial_count, failed_count)
+                elif i % 5 == 0 or i == len(entries):
                     log.info(f"  Progress {i}/{len(entries)} ({ok_count} fully ok)")
 
+            for name, fut in org_futures.items():
+                result = fut.result()
+                ctx.manifest["phases"][name] = result
+                if progress_ui:
+                    ok = not (isinstance(result, dict) and result.get("ok") is False)
+                    progress_ui.finish_org_phase(name, ok)
+
         if ctx.include_quality_score:
-            aggregate_quality_org(ctx, log)
+            if ctx.state.org_phase_status(ctx.run_id, "aggregate-quality-org") in DONE_STATUSES:
+                log.info("Skip aggregate-quality-org (already ok from a previous run)")
+            else:
+                run_org_phase(
+                    ctx, log, "aggregate-quality-org", lambda: aggregate_quality_org(ctx, log) or {}
+                )
         else:
             log.info("Repo-quality-score rollup skipped (disabled for this pipeline variant)")
 
-        ctx.manifest["repos"] = sorted(repo_results, key=lambda r: r.get("full_name", ""))
+        # This generation's repo pool is the source of truth for every repo it
+        # touched; anything from a prior generation's manifest for a repo not
+        # in this run's `entries` (impossible today, since discovery always
+        # re-runs, but kept defensive) is left alone rather than dropped.
+        prior_repos = {r.get("full_name"): r for r in ctx.manifest.get("repos", [])}
+        for r in repo_results:
+            prior_repos[r.get("full_name")] = r
+        ctx.manifest["repos"] = sorted(prior_repos.values(), key=lambda r: r.get("full_name", ""))
         ctx.manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        all_repos = ctx.manifest["repos"]
         ctx.manifest["summary"] = {
-            "total": len(entries),
-            "fully_ok": sum(1 for r in repo_results if r.get("overall") == "ok"),
-            "partial": sum(1 for r in repo_results if r.get("overall") == "partial"),
-            "failed": sum(1 for r in repo_results if r.get("overall") in ("failed", "error")),
+            "total": len(all_repos),
+            "fully_ok": sum(1 for r in all_repos if r.get("overall") == "ok"),
+            "partial": sum(1 for r in all_repos if r.get("overall") == "partial"),
+            "failed": sum(1 for r in all_repos if r.get("overall") in ("failed", "error")),
         }
 
         manifest_path = ctx.run_dir / "manifest.json"
         manifest_path.write_text(json.dumps(ctx.manifest, indent=2), encoding="utf-8")
 
-        remove_clones(ctx, log)
-        if ctx.platform != "local":
+        fully_ok = (
+            ctx.manifest["summary"]["failed"] == 0
+            and ctx.manifest["summary"]["partial"] == 0
+            and not ctx.state.failures(ctx.run_id)
+        )
+
+        if fully_ok:
+            remove_clones(ctx, log)
             ctx.manifest["clones_removed"] = True
         else:
+            log.info(f"Run has failures -- keeping clones for resume: {ctx.clones_dir}")
             ctx.manifest["clones_removed"] = False
+        if ctx.platform == "local":
+            # The disposable working copy under clones_dir may have been
+            # removed above; the user's actual --local-repos-dir checkout is
+            # never touched (see copy_local_repo), regardless of run outcome.
             ctx.manifest["local_source_preserved"] = True
         manifest_path.write_text(json.dumps(ctx.manifest, indent=2), encoding="utf-8")
 
-        zip_path = create_run_zip(ctx.run_dir)
-        log.info(f"Run complete. Manifest: {manifest_path}")
-        log.info(f"Zip: {zip_path}")
-        log.info(
+        failures_path = write_failures_report(ctx, log)
+        ctx.state.finish_run(ctx.run_id, "ok" if fully_ok else "partial")
+
+        if fully_ok:
+            zip_path = create_run_zip(ctx.run_dir, ctx.clones_dir)
+            log.important(f"Zip: {zip_path}")
+        else:
+            log.important(f"Skipping zip (run incomplete). Resume with: org-analyser resume {ctx.run_dir}")
+
+        log.important(f"Run complete. Manifest: {manifest_path}")
+        if failures_path:
+            log.important(f"Failures: {failures_path}")
+        log.important(
             f"Summary: {ctx.manifest['summary']['fully_ok']} ok, "
             f"{ctx.manifest['summary']['partial']} partial, "
             f"{ctx.manifest['summary']['failed']} failed"
         )
-        return 0
+        return 0 if fully_ok else 1
+    except KeyboardInterrupt:
+        log.error(
+            f"Pipeline interrupted (Ctrl-C). Every completed phase is durable in "
+            f"state.db -- resume with: org-analyser resume {ctx.run_dir}"
+        )
+        raise
     except SystemExit as exc:
         raise exc
     except Exception as exc:
@@ -1746,10 +2214,389 @@ def run_pipeline() -> int:
             json.dumps(ctx.manifest, indent=2), encoding="utf-8"
         )
         return 1
+    finally:
+        ctx.state.close()
+
+
+def run_pipeline(args: argparse.Namespace) -> int:
+    print_transparency_banner(args.local_only)
+    include_quality_score = not args.skip_quality_score
+    ctx = build_run_context(args, include_quality_score=include_quality_score)
+    ctx.run_dir.mkdir(parents=True, exist_ok=True)
+    ctx.profiler_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx.state = StateStore(ctx.run_dir / "state.db")
+    ctx.run_id = ctx.state.init_run(ctx.run_dir, ctx.target, ctx.platform, vars(args))
+    ctx.generation = ctx.state.get_generation(ctx.run_id)
+
+    log = PipelineLogger(ctx.pipeline_log, quiet=args.quiet)
+    return execute_pipeline(ctx, args, log)
+
+
+def _find_latest_run(
+    output_dir: Path, predicate: Callable[[Any], bool] | None = None
+) -> Path | None:
+    if not output_dir.is_dir():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    for child in sorted(output_dir.iterdir()):
+        db_path = child / "state.db"
+        if not child.is_dir() or not db_path.is_file():
+            continue
+        try:
+            store = StateStore(db_path)
+            row = store.load_run(child)
+            store.close()
+        except Exception:
+            continue
+        if row is None or (predicate and not predicate(row)):
+            continue
+        candidates.append((db_path.stat().st_mtime, child))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
+
+
+def resume_pipeline(run_dir_arg: str | None, output_dir: str, quiet: bool = False) -> int:
+    if run_dir_arg:
+        run_dir = Path(run_dir_arg).expanduser().resolve()
+    else:
+        found = _find_latest_run(
+            Path(output_dir).expanduser().resolve(), lambda row: row["status"] != OK
+        )
+        if not found:
+            print("No incomplete run found to resume.", file=sys.stderr)
+            return 1
+        run_dir = found
+
+    db_path = run_dir / "state.db"
+    if not db_path.is_file():
+        print(f"No state.db under {run_dir} -- nothing to resume.", file=sys.stderr)
+        return 1
+
+    state = StateStore(db_path)
+    row = state.load_run(run_dir)
+    if not row:
+        print(f"No run row found for {run_dir} in {db_path}.", file=sys.stderr)
+        return 1
+
+    config = json.loads(row["config_json"])
+    args = argparse.Namespace(**config)
+    include_quality_score = not args.skip_quality_score
+    ctx = build_run_context(args, include_quality_score, run_dir_override=run_dir)
+    ctx.run_dir.mkdir(parents=True, exist_ok=True)
+    ctx.profiler_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx.state = state
+    ctx.run_id = int(row["id"])
+    ctx.generation = state.resume_run(ctx.run_id)
+
+    manifest_path = ctx.run_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            ctx.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            ctx.manifest = {}
+
+    log = PipelineLogger(ctx.pipeline_log, quiet=quiet)
+    log.important(f"Resuming run {run_dir} at generation {ctx.generation}")
+    print_transparency_banner(args.local_only)
+    return execute_pipeline(ctx, args, log)
+
+
+def status_command(run_dir_arg: str | None, output_dir: str, repo: str | None, failures_only: bool) -> int:
+    if run_dir_arg:
+        run_dir = Path(run_dir_arg).expanduser().resolve()
+    else:
+        found = _find_latest_run(Path(output_dir).expanduser().resolve())
+        if not found:
+            print("No run found.", file=sys.stderr)
+            return 1
+        run_dir = found
+
+    db_path = run_dir / "state.db"
+    if not db_path.is_file():
+        print(f"No state.db under {run_dir}.", file=sys.stderr)
+        return 1
+
+    state = StateStore(db_path)
+    row = state.load_run(run_dir)
+    if not row:
+        print(f"No run row in {db_path}.", file=sys.stderr)
+        return 1
+    run_id = int(row["id"])
+
+    print(f"Run: {run_dir}")
+    print(f"Target: {row['platform']}:{row['target']}  status={row['status']}  generation={row['generation']}")
+    print()
+
+    if repo:
+        events = state.trace(run_id, repo)
+        if not events:
+            print(f"No events recorded for repo {repo!r}.")
+        for e in events:
+            line = (
+                f"  [{e['ts']}] gen={e['generation']} {e['phase']:<20} {e['event']:<16} "
+                f"attempt={e['attempt']}"
+            )
+            if e["duration_ms"]:
+                line += f" ({e['duration_ms']}ms)"
+            if e["error_tail"]:
+                line += f"  ERROR: {e['error_tail']}"
+            print(line)
+        state.close()
+        return 0
+
+    if failures_only:
+        failures = state.failures(run_id)
+        if not failures:
+            print("No failures.")
+        for f in failures:
+            header = f["phase"] if f["scope"] == "org" else f"{f['repo']}  {f['phase']}"
+            print(f"  [{f['status'].upper()}] {header}  attempts={f['attempts']}  log={f['log_path']}")
+            if f["error"]:
+                print(f"      {f['error'].strip().splitlines()[-1][:200]}")
+        state.close()
+        return 0
+
+    summary = state.status_summary(run_id)
+    print("Org phases:")
+    for p in summary["org_phases"]:
+        print(f"  [{p['status'].upper():<11}] {p['phase']:<24} attempts={p['attempts']}")
+    print()
+    counts = summary["repo_counts"]
+    print(
+        f"Repos: {summary['repo_count']} total -- ok={counts['ok']} partial={counts['partial']} "
+        f"failed={counts['failed']} running={counts['running']} pending={counts['pending']}"
+    )
+    if counts["failed"] or counts["running"]:
+        print("\nRepos needing attention:")
+        seen: set[str] = set()
+        for r in summary["repo_phases"]:
+            if r["status"] in ("failed", "interrupted", "running") and r["repo"] not in seen:
+                seen.add(r["repo"])
+                print(f"  {r['repo']}: {r['phase']} -> {r['status']}")
+    state.close()
+    return 0
+
+
+def retry_command(
+    run_dir_arg: str | None,
+    output_dir: str,
+    phase: str | None,
+    repo: str | None,
+    force: bool,
+) -> int:
+    if run_dir_arg:
+        run_dir = Path(run_dir_arg).expanduser().resolve()
+    else:
+        found = _find_latest_run(Path(output_dir).expanduser().resolve())
+        if not found:
+            print("No run found.", file=sys.stderr)
+            return 1
+        run_dir = found
+
+    db_path = run_dir / "state.db"
+    if not db_path.is_file():
+        print(f"No state.db under {run_dir}.", file=sys.stderr)
+        return 1
+
+    state = StateStore(db_path)
+    row = state.load_run(run_dir)
+    if not row:
+        print(f"No run row in {db_path}.", file=sys.stderr)
+        return 1
+    run_id = int(row["id"])
+
+    quality_touched = False
+    if not phase and not repo:
+        n = state.reset_repo_all_failed(run_id)
+        print(f"Reset {n} failed/interrupted/running phase row(s) to pending.")
+        quality_touched = True
+    elif phase and not repo:
+        if phase in ("merged-pr-counts", "pr-task-profile", "aggregate-quality-org"):
+            state.reset_phase(run_id, phase, force=force)
+            print(f"Reset org phase {phase!r}.")
+        else:
+            n = state.reset_phase_all_repos(run_id, phase, force=force)
+            print(f"Reset {n} row(s) for phase {phase!r} across all repos.")
+            if force:
+                repos = {r["repo"] for r in state.status_summary(run_id)["repo_phases"]}
+                for r in repos:
+                    _invalidate_downstream(state, run_id, r, phase)
+            quality_touched = phase == "repo-quality-score"
+    elif repo and not phase:
+        phases = state.repo_phases_for(run_id, repo)
+        for p in phases:
+            state.reset_phase(run_id, p.phase, repo, force=force)
+        print(f"Reset all {len(phases)} phase(s) for repo {repo!r}.")
+        quality_touched = True
+    else:
+        state.reset_phase(run_id, phase, repo, force=force)
+        print(f"Reset phase {phase!r} for repo {repo!r}.")
+        if force:
+            _invalidate_downstream(state, run_id, repo, phase)
+        quality_touched = phase == "repo-quality-score"
+
+    if quality_touched:
+        # Invalidation, not a retry-scope decision -- the aggregate is stale
+        # the moment any repo's repo-quality-score is reset, regardless of
+        # the aggregate's own current status or the CLI --force flag.
+        state.reset_phase(run_id, "aggregate-quality-org", force=True)
+
+    state.close()
+    print(f"Apply with: org-analyser resume {run_dir}")
+    return 0
+
+
+def _print_check_table(results: list[tuple[str, bool, str]]) -> bool:
+    all_ok = True
+    print("\norg-analyser check -- sanity results:", file=sys.stderr)
+    for name, ok, detail in results:
+        if not ok:
+            all_ok = False
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}", file=sys.stderr)
+    print(
+        "\nAll checks passed -- safe to run."
+        if all_ok
+        else "\nOne or more checks failed -- fix the above before running.",
+        file=sys.stderr,
+    )
+    return all_ok
+
+
+def run_check(args: argparse.Namespace) -> int:
+    """`org-analyser check`: prove the run will complete before spending any
+    time on it. Deeper than preflight() (which only checks presence) -- this
+    makes live calls: list repos, git ls-remote one of them, ping the LLM
+    endpoint, check disk space. Any failure means abort with zero clones
+    made and zero API quota burned on the real phases."""
+    print_transparency_banner(args.local_only)
+    include_quality_score = not args.skip_quality_score
+    ctx = build_run_context(args, include_quality_score=include_quality_score)
+
+    check_dir = Path(args.output_dir).expanduser().resolve() / ".check"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log = PipelineLogger(check_dir / f"check-{stamp}.log")
+
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, fn: Callable[[], str]) -> None:
+        try:
+            results.append((name, True, fn()))
+        except Exception as exc:
+            results.append((name, False, f"{type(exc).__name__}: {exc}"))
+
+    try:
+        preflight(ctx, log)
+        results.append(("preflight (tokens/tools present)", True, "ok"))
+    except SystemExit:
+        results.append(("preflight (tokens/tools present)", False, "see errors logged above"))
+        return 0 if _print_check_table(results) else 1
+
+    def _check_disk() -> str:
+        probe_dir = Path(args.output_dir).expanduser()
+        usage = shutil.disk_usage(probe_dir if probe_dir.exists() else probe_dir.parent)
+        free_gb = usage.free / (1024**3)
+        if free_gb < 2:
+            raise RuntimeError(f"only {free_gb:.1f} GB free under {probe_dir}")
+        return f"{free_gb:.1f} GB free"
+
+    check("disk space", _check_disk)
+
+    def _check_output_dir() -> str:
+        d = Path(args.output_dir).expanduser().resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".org-analyser-write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return str(d)
+
+    check("output directory writable", _check_output_dir)
+
+    entries: list[RepoEntry] = []
+
+    def _check_discovery() -> str:
+        nonlocal entries
+        entries = discover_repos(ctx, log)
+        if not entries:
+            raise RuntimeError("no repos discovered")
+        return f"{len(entries)} repos"
+
+    check(f"list repos ({ctx.platform}:{ctx.target})", _check_discovery)
+
+    def _check_clone_auth() -> str:
+        if not entries:
+            raise RuntimeError("skipped: repo listing failed above")
+        sample = entries[0]
+        if sample.is_local:
+            return f"local checkout: {sample.local_path}"
+        url = clone_url(sample, ctx.tokens, ctx)
+        token = ""
+        user = "x-access-token"
+        if sample.platform == "github":
+            token = ctx.tokens.get(ctx.github_token_name, "")
+        elif sample.platform == "gitlab":
+            token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
+        elif sample.platform == "bitbucket":
+            token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
+            user = resolve_bitbucket_git_auth(token, ctx.tokens.get(BITBUCKET_USERNAME_NAME, "").strip())
+        env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+        if token:
+            auth = base64.b64encode(f"{user}:{token}".encode()).decode()
+            env["GIT_CONFIG_COUNT"] = "1"
+            env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
+            env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {auth}"
+        proc = subprocess.run(
+            ["git", *git_longpath_config(), "ls-remote", url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(scrub_secrets((proc.stderr or proc.stdout or "")[-400:], token))
+        return f"git ls-remote ok ({sample.full_name})"
+
+    check("git clone auth", _check_clone_auth)
+
+    def _check_llm() -> str:
+        if ctx.local_only:
+            return "skipped (--local-only)"
+        if ctx.pr_rubrics_provider == "gemini":
+            return "skipped (gemini live-check not implemented)"
+        from llm.llm_safety import safe_openai  # noqa: WPS433
+
+        safe_openai().models.list()
+        return "LLM endpoint reachable"
+
+    check("LLM credentials live", _check_llm)
+
+    return 0 if _print_check_table(results) else 1
 
 
 def main() -> int:
-    return run_pipeline()
+    argv = sys.argv[1:]
+    if not argv or (argv[0] not in COMMANDS and argv[0] not in ("-h", "--help")):
+        argv = ["run", *argv]
+    parser = build_top_parser()
+    args = parser.parse_args(argv)
+
+    if args.command in ("run", "check"):
+        args = finalize_run_args(args, parser)
+    if args.command == "run":
+        return run_pipeline(args)
+    if args.command == "check":
+        return run_check(args)
+    if args.command == "resume":
+        return resume_pipeline(args.run_dir, args.output_dir, quiet=args.quiet)
+    if args.command == "status":
+        return status_command(args.run_dir, args.output_dir, args.repo, args.failures)
+    if args.command == "retry":
+        return retry_command(args.run_dir, args.output_dir, args.phase, args.repo, args.force)
+    parser.error("a command is required")
+    return 2
 
 
 if __name__ == "__main__":

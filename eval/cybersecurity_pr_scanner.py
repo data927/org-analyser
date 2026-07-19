@@ -356,6 +356,9 @@ def scan_repo(
     run_layer2: bool,
     layer2_model: str,
     fetch_files: bool,
+    batch_work_dir: Optional[Path] = None,
+    llm_mode: str = "auto",
+    llm_batch_threshold: int = 50,
 ) -> Dict[str, Any]:
     full_name = f"{owner}/{repo}"
     logger.info(
@@ -369,9 +372,13 @@ def scan_repo(
     total = len(pulls)
     results: List[Dict[str, Any]] = []
     l1_passed = 0
-    l2_calls = 0
     prog_every = max(1, total // 20) if total > 40 else max(5, total // 10 or 1)
 
+    # Pass 1: Layer1 (local heuristics) + file listing for every PR. Collects
+    # the full set of Layer1-passing PRs before any Layer2 call is made --
+    # batch processing needs the whole request set up front, so nothing here
+    # calls the LLM yet.
+    layer2_contexts: List[Dict[str, Any]] = []
     for idx, pr in enumerate(pulls, start=1):
         num = pr["number"]
         if idx == 1 or idx == total or idx % prog_every == 0:
@@ -427,30 +434,17 @@ def scan_repo(
                 "; ".join(l1.signals[:5]) + (" …" if len(l1.signals) > 5 else ""),
             )
             if run_layer2:
-                l2_calls += 1
-                logger.info(
-                    "Layer2 calling OpenAI PR #%d model=%r",
-                    num,
-                    layer2_model,
+                layer2_contexts.append(
+                    {
+                        "number": num,
+                        "repo_full": full_name,
+                        "title": title,
+                        "body": body,
+                        "labels": labels,
+                        "file_paths": paths[:80],
+                        "layer1_signals": l1.signals,
+                    }
                 )
-                l2 = run_layer2_llm(
-                    repo_full=f"{owner}/{repo}",
-                    title=title,
-                    body=body,
-                    labels=labels,
-                    file_paths=paths[:80],
-                    layer1_signals=l1.signals,
-                    model=layer2_model,
-                )
-                row["layer2"] = asdict(l2) if l2 else {"error": "layer2_failed"}
-                if l2:
-                    logger.info(
-                        "Layer2 done PR #%d → security_related=%s conf=%s tags=%s",
-                        num,
-                        l2.is_security_related,
-                        l2.confidence,
-                        l2.categories,
-                    )
             else:
                 row["layer2"] = {
                     "skipped": True,
@@ -459,6 +453,38 @@ def scan_repo(
                 logger.info("Layer2 skipped (--skip-layer2) for PR #%d", num)
 
         results.append(row)
+
+    # Pass 2: one batched (or, below threshold, thread-pooled sync) Layer2
+    # call for every Layer1-passing PR in this repo instead of one live
+    # request per PR.
+    if layer2_contexts:
+        logger.info(
+            "Layer2: classifying %d candidate PR(s) for %s (llm_mode=%s, model=%s)",
+            len(layer2_contexts), full_name, llm_mode, layer2_model,
+        )
+        work_dir = batch_work_dir or (Path("outputs") / "batch_state" / full_name.replace("/", "_"))
+        layer2_by_number = run_layer2_llm_batch(
+            layer2_contexts, layer2_model, work_dir, tag=full_name.replace("/", "_"),
+            mode=llm_mode, threshold=llm_batch_threshold,
+        )
+    else:
+        layer2_by_number = {}
+
+    l2_calls = len(layer2_contexts)
+    candidate_numbers = {ctx["number"] for ctx in layer2_contexts}
+    for row in results:
+        num = row["number"]
+        if num not in candidate_numbers:
+            # Either failed Layer1 (row["layer2"] stays None) or Layer2 was
+            # disabled (row["layer2"] already holds the skipped-marker dict).
+            continue
+        l2 = layer2_by_number.get(num)
+        row["layer2"] = asdict(l2) if l2 else {"error": "layer2_failed"}
+        if l2:
+            logger.info(
+                "Layer2 done PR #%d → security_related=%s conf=%s tags=%s",
+                num, l2.is_security_related, l2.confidence, l2.categories,
+            )
 
     logger.info(
         "━━ Scan done %s ━━ PRs=%d layer1_passed=%d layer2_calls=%d",
@@ -476,39 +502,7 @@ def scan_repo(
     }
 
 
-def run_layer2_llm(
-    *,
-    repo_full: str,
-    title: str,
-    body: str,
-    labels: List[str],
-    file_paths: List[str],
-    layer1_signals: List[str],
-    model: str,
-) -> Optional[Layer2Result]:
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    try:
-        from llm.llm_safety import llm_available, safe_openai
-    except ImportError:
-        logger.warning("Layer2 skipped: openai package not installed")
-        return Layer2Result(
-            is_security_related=False,
-            confidence="none",
-            categories=[],
-            rationale="openai package not installed",
-            raw=None,
-        )
-    if not llm_available():
-        logger.warning("Layer2 skipped: no LLM configured (OpenAI or Azure)")
-        return Layer2Result(
-            is_security_related=False,
-            confidence="none",
-            categories=[],
-            rationale="no LLM configured",
-            raw=None,
-        )
-
-    instructions = """You classify GitHub pull requests for cybersecurity relevance.
+LAYER2_INSTRUCTIONS = """You classify GitHub pull requests for cybersecurity relevance.
 Cybersecurity includes: vulns/CVEs/advisories, authn/z, crypto/TLS/secrets, IAM/RBAC,
 application security (XSS, CSRF, injection, etc.), infra hardening, supply chain,
 privacy/compliance-related controls, security logging/monitoring, and dependency updates
@@ -521,6 +515,11 @@ Return a single JSON object with keys:
   "rationale" (1-3 short sentences, plain text).
 Be conservative: if the change is only cosmetic or unrelated, is_security_related must be false."""
 
+
+def _layer2_messages(
+    *, repo_full: str, title: str, body: str, labels: List[str], file_paths: List[str],
+    layer1_signals: List[str],
+) -> List[Dict[str, str]]:
     user_payload = {
         "repository": repo_full,
         "title": title,
@@ -529,42 +528,25 @@ Be conservative: if the change is only cosmetic or unrelated, is_security_relate
         "changed_files": file_paths,
         "layer1_signals": layer1_signals,
     }
+    return [
+        {"role": "system", "content": LAYER2_INSTRUCTIONS},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+    ]
 
-    client = safe_openai(api_key=key)
+
+def _layer2_result_from_content(content: Optional[str], error: Optional[str]) -> Layer2Result:
+    if error:
+        return Layer2Result(
+            is_security_related=False, confidence="none", categories=[],
+            rationale=f"OpenAI error: {error}", raw=None,
+        )
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0.1,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": instructions},
-                {
-                    "role": "user",
-                    "content": json.dumps(user_payload, ensure_ascii=False),
-                },
-            ],
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        data = json.loads(content)
+        data = json.loads((content or "").strip())
     except json.JSONDecodeError as e:
-        logger.exception("Layer2 JSON decode failed for repo %s", repo_full)
         return Layer2Result(
-            is_security_related=False,
-            confidence="none",
-            categories=[],
-            rationale=f"LLM JSON parse error: {e}",
-            raw=None,
+            is_security_related=False, confidence="none", categories=[],
+            rationale=f"LLM JSON parse error: {e}", raw=None,
         )
-    except Exception as e:
-        logger.exception("Layer2 OpenAI request failed for %s", repo_full)
-        return Layer2Result(
-            is_security_related=False,
-            confidence="none",
-            categories=[],
-            rationale=f"OpenAI error: {e}",
-            raw=None,
-        )
-
     return Layer2Result(
         is_security_related=bool(data.get("is_security_related")),
         confidence=str(data.get("confidence") or "low"),
@@ -572,6 +554,124 @@ Be conservative: if the change is only cosmetic or unrelated, is_security_relate
         rationale=str(data.get("rationale") or ""),
         raw=data,
     )
+
+
+def run_layer2_llm(
+    *,
+    repo_full: str,
+    title: str,
+    body: str,
+    labels: List[str],
+    file_paths: List[str],
+    layer1_signals: List[str],
+    model: str,
+) -> Optional[Layer2Result]:
+    """Single-PR entry point, kept for direct/interactive use. scan_repo below
+    batches all of a repo's Layer1-passing PRs through run_layer2_llm_batch
+    instead of calling this in a loop."""
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    try:
+        from llm.llm_safety import llm_available, safe_openai
+    except ImportError:
+        logger.warning("Layer2 skipped: openai package not installed")
+        return Layer2Result(
+            is_security_related=False, confidence="none", categories=[],
+            rationale="openai package not installed", raw=None,
+        )
+    if not llm_available():
+        logger.warning("Layer2 skipped: no LLM configured (OpenAI or Azure)")
+        return Layer2Result(
+            is_security_related=False, confidence="none", categories=[],
+            rationale="no LLM configured", raw=None,
+        )
+
+    from llm.batch import BatchItem  # noqa: WPS433
+
+    client = safe_openai(api_key=key)
+    item = BatchItem(
+        custom_id="single",
+        messages=_layer2_messages(
+            repo_full=repo_full, title=title, body=body, labels=labels,
+            file_paths=file_paths, layer1_signals=layer1_signals,
+        ),
+        model=model,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+    )
+    result = _sync_layer2_item(client, item)
+    return _layer2_result_from_content(result.content, result.error)
+
+
+def _sync_layer2_item(client: Any, item: "BatchItem") -> "BatchItemResult":
+    from llm.batch import BatchItemResult  # noqa: WPS433
+
+    try:
+        resp = client.chat.completions.create(
+            model=item.model,
+            temperature=item.temperature,
+            response_format=item.response_format,
+            messages=item.messages,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        return BatchItemResult(item.custom_id, True, content, None, item.metadata)
+    except Exception as e:
+        logger.exception("Layer2 OpenAI request failed for custom_id=%s", item.custom_id)
+        return BatchItemResult(item.custom_id, False, None, str(e), item.metadata)
+
+
+def run_layer2_llm_batch(
+    pr_contexts: List[Dict[str, Any]],
+    model: str,
+    work_dir: Path,
+    tag: str,
+    mode: str = "auto",
+    threshold: int = 50,
+    max_workers: int = 8,
+) -> Dict[int, Layer2Result]:
+    """Batch Layer2 across every Layer1-passing PR in one repo scan, instead
+    of one live chat.completions.create call per PR. Each entry in
+    `pr_contexts` needs: number, repo_full, title, body, labels, file_paths,
+    layer1_signals. Returns {pr_number: Layer2Result}."""
+    from llm.batch import BatchItem, run_batch_or_sync  # noqa: WPS433
+    from llm.llm_safety import llm_available, safe_openai  # noqa: WPS433
+
+    if not pr_contexts:
+        return {}
+    if not llm_available():
+        logger.warning("Layer2 skipped: no LLM configured (OpenAI or Azure)")
+        return {
+            ctx["number"]: Layer2Result(
+                is_security_related=False, confidence="none", categories=[],
+                rationale="no LLM configured", raw=None,
+            )
+            for ctx in pr_contexts
+        }
+
+    client = safe_openai()
+    items = [
+        BatchItem(
+            custom_id=str(ctx["number"]),
+            messages=_layer2_messages(
+                repo_full=ctx["repo_full"], title=ctx["title"], body=ctx["body"],
+                labels=ctx["labels"], file_paths=ctx["file_paths"],
+                layer1_signals=ctx["layer1_signals"],
+            ),
+            model=model,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            metadata={"number": ctx["number"]},
+        )
+        for ctx in pr_contexts
+    ]
+    results = run_batch_or_sync(
+        client, items, work_dir, tag=tag,
+        sync_fn=lambda item: _sync_layer2_item(client, item),
+        mode=mode, threshold=threshold, max_workers=max_workers,
+    )
+    return {
+        r.metadata["number"]: _layer2_result_from_content(r.content, None if r.ok else (r.error or "unknown error"))
+        for r in results
+    }
 
 
 def parse_owner_repo(full: str) -> Tuple[str, str]:
@@ -605,6 +705,26 @@ def main() -> int:
         help="Do not list per-PR files (faster, weaker layer1 path signals)",
     )
     p.add_argument("--layer2-model", default="gpt-4o-mini", help="OpenAI model for layer2")
+    p.add_argument(
+        "--llm-mode",
+        choices=("auto", "batch", "sync"),
+        default="auto",
+        help="Layer2 LLM call strategy: 'batch' submits every candidate PR in a repo as "
+        "one OpenAI Batch API job (~50%% cheaper, no live-request-per-PR cost), 'sync' "
+        "is one live call per PR, 'auto' (default) batches once a repo has "
+        "--llm-batch-threshold or more candidates.",
+    )
+    p.add_argument(
+        "--llm-batch-threshold",
+        type=int,
+        default=50,
+        help="Candidate-PR count at/above which --llm-mode=auto switches to the Batch API.",
+    )
+    p.add_argument(
+        "--batch-work-dir",
+        default=None,
+        help="Directory for Batch API request/state files (default: alongside --json-out).",
+    )
     p.add_argument(
         "--json-out",
         required=True,
@@ -647,6 +767,8 @@ def main() -> int:
         "repositories": [],
     }
 
+    batch_work_dir = Path(args.batch_work_dir) if args.batch_work_dir else Path(args.json_out).with_suffix("").parent / "batch_state"
+
     if args.repo:
         logger.info("Mode: single repo %s", args.repo)
         owner, name = parse_owner_repo(args.repo)
@@ -660,6 +782,9 @@ def main() -> int:
                 run_layer2=run_l2,
                 layer2_model=args.layer2_model,
                 fetch_files=fetch_files,
+                batch_work_dir=batch_work_dir,
+                llm_mode=args.llm_mode,
+                llm_batch_threshold=args.llm_batch_threshold,
             )
         )
     else:
@@ -682,6 +807,9 @@ def main() -> int:
                         run_layer2=run_l2,
                         layer2_model=args.layer2_model,
                         fetch_files=fetch_files,
+                        batch_work_dir=batch_work_dir / fn.replace("/", "_"),
+                        llm_mode=args.llm_mode,
+                        llm_batch_threshold=args.llm_batch_threshold,
                     )
                 )
             except requests.HTTPError as e:

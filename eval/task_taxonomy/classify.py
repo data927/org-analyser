@@ -28,13 +28,14 @@ import random
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Literal
 
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+from openai.lib._parsing._completions import type_to_response_format_param
 from pydantic import BaseModel, Field
 
+from llm.batch import BatchItem, BatchItemResult, run_batch_or_sync
 from llm.llm_safety import safe_openai
 
 from .taxonomy import (
@@ -90,6 +91,14 @@ class LLMClassification(BaseModel):
     ecosystem_tags: list[str] = Field(default_factory=list)
     llm_capability_tags: list[str] = Field(default_factory=list)
     summary: str = Field(description="One-sentence task summary")
+
+
+# The Batch API's JSONL request body needs a plain response_format dict, not
+# a Pydantic class -- .beta.chat.completions.parse() (used by classify()
+# below) builds this same dict internally via this same OpenAI SDK helper, so
+# reusing it here guarantees the batch path parses identically to the sync
+# path instead of a hand-rolled JSON schema silently drifting from it.
+_LLM_CLASSIFICATION_RESPONSE_FORMAT = type_to_response_format_param(LLMClassification)
 
 
 # ── Classifier ──────────────────────────────────────────────────────────────
@@ -216,35 +225,103 @@ class TaxonomyClassifier:
         diff_col: str = "gold_patch",
         problem_col: str | None = None,
         language_col: str | None = "language",
+        batch_work_dir: Path | None = None,
+        llm_mode: str = "auto",
+        llm_batch_threshold: int = 50,
+        tag: str = "taxonomy",
     ) -> list[dict[str, Any]]:
-        """Classify a list of items concurrently.
+        """Classify a list of items via llm.batch.run_batch_or_sync.
 
-        Each item is a dict whose keys map to the column names above.
-        Returns a list of classification dicts in the same order.
+        Each item is a dict whose keys map to the column names above. Returns
+        a list of classification dicts in the same order. `llm_mode="auto"`
+        (default) submits everything as one OpenAI Batch API job once `items`
+        reaches `llm_batch_threshold`, instead of one live request per item.
         """
-        results: list[dict[str, Any] | None] = [None] * len(items)
+        diff_stats_by_idx: dict[int, DiffStats | None] = {}
+        batch_items: list[BatchItem] = []
+        for idx, item in enumerate(items):
+            query = str(item.get(query_col, "") or "")
+            repo = str(item.get(repo_col, "") or "")
+            diff = str(item.get(diff_col, "") or "")
+            problem_statement = str(item.get(problem_col, "") or "") if problem_col else ""
+            language = str(item.get(language_col, "") or "") if language_col else ""
 
-        def _do(idx: int, item: dict) -> tuple[int, dict]:
-            try:
-                return idx, self.classify(
-                    query=str(item.get(query_col, "") or ""),
-                    repo=str(item.get(repo_col, "") or ""),
-                    diff=str(item.get(diff_col, "") or ""),
-                    problem_statement=str(item.get(problem_col, "") or "") if problem_col else "",
-                    language=str(item.get(language_col, "") or "") if language_col else "",
+            diff_stats = parse_diff(diff) if diff else None
+            diff_stats_by_idx[idx] = diff_stats
+
+            user_prompt = self._user_prompt(
+                query=query, repo=repo, diff=diff, problem_statement=problem_statement,
+                language=language, diff_stats=diff_stats,
+            )
+            batch_items.append(
+                BatchItem(
+                    custom_id=str(idx),
+                    messages=[
+                        {"role": "system", "content": self._system_prompt()},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    model=self.model,
+                    temperature=0.1,
+                    response_format=_LLM_CLASSIFICATION_RESPONSE_FORMAT,
+                    metadata={"idx": idx},
                 )
+            )
+
+        work_dir = batch_work_dir or (Path("outputs") / "batch_state" / "taxonomy")
+        batch_results = run_batch_or_sync(
+            self.client,
+            batch_items,
+            work_dir,
+            tag=tag,
+            sync_fn=self._sync_classify_item,
+            mode=llm_mode,
+            threshold=llm_batch_threshold,
+            max_workers=self.concurrency,
+        )
+
+        results: list[dict[str, Any] | None] = [None] * len(items)
+        for r in batch_results:
+            idx = r.metadata["idx"]
+            if not r.ok:
+                print(f"[ERROR] Item {idx}: {r.error}", file=sys.stderr)
+                results[idx] = {"error": r.error, "summary": f"Classification failed: {r.error}"}
+                continue
+            try:
+                llm = LLMClassification.model_validate_json(r.content)
+                results[idx] = self._merge(llm, diff_stats_by_idx[idx])
             except Exception as exc:
                 print(f"[ERROR] Item {idx}: {exc}", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
-                return idx, {"error": str(exc), "summary": f"Classification failed: {exc}"}
-
-        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            futures = {pool.submit(_do, i, item): i for i, item in enumerate(items)}
-            for fut in as_completed(futures):
-                idx, res = fut.result()
-                results[idx] = res
+                results[idx] = {"error": str(exc), "summary": f"Classification failed: {exc}"}
 
         return results  # type: ignore[return-value]
+
+    def _sync_classify_item(self, item: BatchItem) -> BatchItemResult:
+        """The sync-fallback path run_batch_or_sync uses below its batch
+        threshold -- same retry behaviour classify()'s single-item loop has."""
+        last_err: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = self.client.chat.completions.create(
+                    model=item.model,
+                    messages=item.messages,
+                    response_format=item.response_format,
+                    temperature=item.temperature,
+                )
+                content = response.choices[0].message.content or "{}"
+                return BatchItemResult(item.custom_id, True, content, None, item.metadata)
+            except _RETRYABLE as exc:
+                last_err = exc
+                delay = _BASE_DELAY * (2**attempt) + random.uniform(0, 1)
+                print(
+                    f"[WARN] LLM call failed (attempt {attempt + 1}/{_MAX_RETRIES}): "
+                    f"{type(exc).__name__} — retrying in {delay:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+            except Exception as exc:
+                return BatchItemResult(item.custom_id, False, None, str(exc), item.metadata)
+        return BatchItemResult(item.custom_id, False, None, str(last_err), item.metadata)
 
     # ── Private helpers ─────────────────────────────────────────────────
 

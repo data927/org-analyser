@@ -13,3 +13,5 @@ outputs/org-analyser-runs/
 logs/
 *.log
 .DS_Store
+.claude/
+.pytest_cache/

@@ -92,6 +92,7 @@ from platforms.gitlab import paginate as gitlab_platform_paginate
 
 # Shared redacting OpenAI client. This script sends PR titles, bodies and human
 # review comments, so it must not construct a bare OpenAI() client.
+from llm.batch import BatchItem, BatchItemResult, run_batch_or_sync
 from llm.llm_safety import llm_available, safe_openai
 
 try:
@@ -1377,50 +1378,82 @@ def _llm_preflight(client: Any, model: str) -> None:
         )
 
 
+def _parse_classification_content(content: Optional[str]) -> Dict[str, Any]:
+    """Turn one LLM response's raw JSON content into the category/confidence/
+    reason shape used downstream. Shared by the batch and sync paths -- both
+    of llm.batch's run_batch_or_sync branches hand back a raw content string,
+    so this is the one place that interprets it."""
+    try:
+        parsed = json.loads(content or "{}")
+    except json.JSONDecodeError:
+        return {"llm_category": "error", "llm_confidence": "low", "llm_reason": "invalid JSON from LLM"}
+    category = parsed.get("category")
+    if category not in CATEGORIES:
+        category = "other"
+    return {
+        "llm_category": category,
+        "llm_confidence": parsed.get("confidence", "low"),
+        "llm_reason": (parsed.get("reason") or "")[:300],
+    }
+
+
+def _sync_classify_item(
+    client: Any, model: str, item: BatchItem, max_retries: int = 3
+) -> BatchItemResult:
+    """The sync-fallback path run_batch_or_sync uses below its batch
+    threshold -- one live chat.completions.create call per PR, same retry
+    behaviour the old per-PR loop had."""
+    last_err: Optional[str] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=item.temperature,
+                response_format=item.response_format,
+                messages=item.messages,
+            )
+            content = resp.choices[0].message.content or "{}"
+            return BatchItemResult(item.custom_id, True, content, None, item.metadata)
+        except Exception as exc:  # noqa: BLE001
+            last_err = str(exc)
+            logger.warning(
+                "PR #%s: LLM call failed (attempt %d/%d): %s",
+                item.metadata.get("number"), attempt, max_retries, exc,
+            )
+            time.sleep(1.5 * attempt)
+    logger.error("PR #%s: LLM classification failed permanently: %s",
+                 item.metadata.get("number"), last_err)
+    return BatchItemResult(item.custom_id, False, None, last_err, item.metadata)
+
+
 def classify_with_llm(
     client: Any,
     model: str,
     llm_input: Dict[str, Any],
     max_retries: int = 3,
 ) -> Dict[str, Any]:
-    user_content = json.dumps(llm_input, ensure_ascii=False)
-    last_err: Optional[str] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-            )
-            content = resp.choices[0].message.content or "{}"
-            parsed = json.loads(content)
-            category = parsed.get("category")
-            if category not in CATEGORIES:
-                logger.debug("PR #%s: LLM returned unknown category %r -> other",
-                             llm_input.get("number"), category)
-                category = "other"
-            return {
-                "llm_category": category,
-                "llm_confidence": parsed.get("confidence", "low"),
-                "llm_reason": (parsed.get("reason") or "")[:300],
-            }
-        except Exception as exc:  # noqa: BLE001
-            last_err = str(exc)
-            logger.warning(
-                "PR #%s: LLM call failed (attempt %d/%d): %s",
-                llm_input.get("number"), attempt, max_retries, exc,
-            )
-            time.sleep(1.5 * attempt)
-    logger.error("PR #%s: LLM classification failed permanently: %s",
-                 llm_input.get("number"), last_err)
+    """Single-PR classification, kept for direct/interactive use. process_prs
+    below no longer calls this in a loop -- it goes through
+    llm.batch.run_batch_or_sync so large PR counts use the Batch API instead
+    of one live request per PR."""
+    item = BatchItem(
+        custom_id="single",
+        messages=[
+            {"role": "system", "content": LLM_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(llm_input, ensure_ascii=False)},
+        ],
+        model=model,
+        temperature=0,
+        response_format={"type": "json_object"},
+        metadata={"number": llm_input.get("number")},
+    )
+    result = _sync_classify_item(client, model, item, max_retries=max_retries)
+    if result.ok:
+        return _parse_classification_content(result.content)
     return {
         "llm_category": "error",
         "llm_confidence": "low",
-        "llm_reason": f"LLM call failed: {last_err}",
+        "llm_reason": f"LLM call failed: {result.error}",
     }
 
 
@@ -1434,6 +1467,9 @@ def process_prs(
     max_workers: int,
     repo: str,
     client: Any = None,
+    batch_work_dir: Optional[Path] = None,
+    llm_mode: str = "auto",
+    llm_batch_threshold: int = 50,
 ) -> List[Dict[str, Any]]:
     if client is None:
         client = safe_openai()
@@ -1453,35 +1489,69 @@ def process_prs(
     if bot_count < len(prs):
         _llm_preflight(client, model)
 
-    logger.info("Running LLM classification with model=%s, workers=%d...", model, max_workers)
-
-    def worker(idx: int) -> Tuple[int, Dict[str, Any]]:
-        sig = signals[idx]
+    results: Dict[int, Dict[str, Any]] = {}
+    items: List[BatchItem] = []
+    for idx, sig in enumerate(signals):
         if sig["author_is_bot"]:
-            return idx, {
+            results[idx] = {
                 "llm_category": "automated",
                 "llm_confidence": "high",
                 "llm_reason": "Bot-authored PR (no LLM call).",
             }
+            continue
         llm_input = build_llm_input(sig, body_texts[idx])
-        return idx, classify_with_llm(client, model, llm_input)
+        items.append(
+            BatchItem(
+                custom_id=str(idx),
+                messages=[
+                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(llm_input, ensure_ascii=False)},
+                ],
+                model=model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                metadata={"idx": idx, "number": sig["number"]},
+            )
+        )
 
-    results: Dict[int, Dict[str, Any]] = {}
-    completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(worker, i) for i in range(len(prs))]
-        for fut in as_completed(futures):
-            idx, llm_result = fut.result()
-            results[idx] = llm_result
+    if items:
+        logger.info(
+            "Classifying %d PRs with model=%s (llm_mode=%s; batches once count >= %d, "
+            "otherwise %d sync workers)...",
+            len(items), model, llm_mode, llm_batch_threshold, max_workers,
+        )
+        work_dir = batch_work_dir or (Path("outputs") / "batch_state" / safe_repo_slug(repo))
+        batch_results = run_batch_or_sync(
+            client,
+            items,
+            work_dir,
+            tag=safe_repo_slug(repo),
+            sync_fn=lambda item: _sync_classify_item(client, model, item),
+            mode=llm_mode,
+            threshold=llm_batch_threshold,
+            max_workers=max_workers,
+        )
+
+        completed = 0
+        for r in batch_results:
+            idx = r.metadata["idx"]
+            if r.ok:
+                results[idx] = _parse_classification_content(r.content)
+            else:
+                results[idx] = {
+                    "llm_category": "error",
+                    "llm_confidence": "low",
+                    "llm_reason": f"LLM call failed: {r.error}",
+                }
             completed += 1
             sig = signals[idx]
             logger.debug(
                 "PR #%s | rules=%s | llm=%s | conf=%s | %s",
-                sig["number"], rules[idx][0], llm_result["llm_category"],
-                llm_result.get("llm_confidence"), sig["title"][:80],
+                sig["number"], rules[idx][0], results[idx]["llm_category"],
+                results[idx].get("llm_confidence"), sig["title"][:80],
             )
-            if completed % 25 == 0 or completed == len(prs):
-                logger.info("  classified %d/%d", completed, len(prs))
+            if completed % 25 == 0 or completed == len(items):
+                logger.info("  classified %d/%d", completed, len(items))
 
     rows: List[Dict[str, Any]] = []
     for idx, sig in enumerate(signals):
@@ -1776,7 +1846,23 @@ def main() -> None:
     parser.set_defaults(include_forks=False)
     parser.add_argument("--output-dir", default="outputs", help="Base directory for report files.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="OpenAI model for the LLM pass.")
-    parser.add_argument("--max-workers", type=int, default=6, help="Parallel LLM calls.")
+    parser.add_argument("--max-workers", type=int, default=6, help="Parallel LLM calls (sync fallback only).")
+    parser.add_argument(
+        "--llm-mode",
+        choices=("auto", "batch", "sync"),
+        default="auto",
+        help="How PR classification calls the LLM: 'batch' uses the OpenAI Batch API "
+        "(one submission for the whole repo, ~50%% cheaper, no live-request-per-PR "
+        "cost), 'sync' is one live chat.completions.create call per PR, 'auto' "
+        "(default) batches once a repo has --llm-batch-threshold or more PRs to "
+        "classify and uses sync below that.",
+    )
+    parser.add_argument(
+        "--llm-batch-threshold",
+        type=int,
+        default=50,
+        help="PR count at/above which --llm-mode=auto switches to the Batch API.",
+    )
     parser.add_argument("--page-size", type=int, default=50,
                         help="Merged PRs per GraphQL page (lower if you see 502 errors).")
     parser.add_argument("--sleep", type=float, default=0.2, help="Sleep seconds between GraphQL pages.")
@@ -1939,6 +2025,9 @@ def main() -> None:
             rows = process_prs(
                 prs, model=args.model, max_workers=args.max_workers,
                 repo=repo, client=client,
+                batch_work_dir=Path(args.output_dir) / "batch_state" / safe_repo_slug(repo),
+                llm_mode=args.llm_mode,
+                llm_batch_threshold=args.llm_batch_threshold,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Classification failed for %s: %s", repo, exc)

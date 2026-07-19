@@ -4251,6 +4251,11 @@ def main():
                 base_url=args.taxonomy_base_url,
                 pr_number=args.pr_number,
                 concurrency=args.taxonomy_concurrency,
+                batch_work_dir=(
+                    Path(args.output).parent / "batch_state" / "taxonomy" / f"{owner}_{repo_name}"
+                    if args.output
+                    else None
+                ),
             )
             report_json.update(taxonomy_results)
             if pr_taxonomy:
