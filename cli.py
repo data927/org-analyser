@@ -363,7 +363,13 @@ def resolve_tokens(tokens_file: str | None) -> dict[str, str]:
         if not path.is_file():
             raise SystemExit(f"tokens file not found: {path}")
         return parse_tokens_file(path)
-    return {str(k): str(v) for k, v in (CONFIG.get("tokens") or {}).items()}
+    # Drop null/blank entries so `tokens.get(name, "")` is empty for unset keys
+    # -- YAML `null` would otherwise stringify to the truthy literal "None".
+    return {
+        str(k): str(v).strip()
+        for k, v in (CONFIG.get("tokens") or {}).items()
+        if v is not None and str(v).strip()
+    }
 
 
 def azure_configured() -> bool:
@@ -379,9 +385,8 @@ def azure_configured() -> bool:
 
 
 def resolve_openai_key(tokens: dict[str, str]) -> str | None:
-    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if env_key:
-        return env_key
+    # config.yml is the single source of truth: an ambient OPENAI_API_KEY in
+    # the shell is deliberately ignored, never consulted here.
     for name in OPENAI_TOKEN_NAMES:
         val = tokens.get(name, "").strip()
         if val:
@@ -563,29 +568,37 @@ def preflight(ctx: RunContext, log: PipelineLogger) -> None:
     except (OSError, subprocess.TimeoutExpired) as exc:
         errors.append(f"Cannot run Python interpreter {PYTHON_BIN}: {exc}")
 
-    # Let the tokens file carry Azure settings too, so it stays the single
-    # place for credentials. A real environment value always wins over the
-    # tokens file. Promoted here so validation and every child process see them.
+    # config.yml (its `tokens:` mapping, or --tokens-file) is the single source
+    # of truth for every credential. The configured value always wins over any
+    # ambient env var, and when config.yml omits a credential its env var is
+    # cleared so a stray shell value can never leak in. Written to os.environ
+    # here so validation and every child process (which inherit it) agree.
     for name in AZURE_TOKEN_NAMES:
         val = ctx.tokens.get(name, "").strip()
-        if val and not os.environ.get(name, "").strip():
+        if val:
             os.environ[name] = val
+        else:
+            os.environ.pop(name, None)
 
     openai_key = resolve_openai_key(ctx.tokens)
     if openai_key:
         os.environ["OPENAI_API_KEY"] = openai_key
-    elif not azure_configured() and not ctx.local_only:
-        errors.append(
-            "Missing LLM credentials: set OPENAI_API_KEY (or openai_key= in the "
-            "tokens file), or configure Azure with AZURE_OPENAI_ENDPOINT + "
-            "AZURE_OPENAI_API_KEY"
-        )
+    else:
+        os.environ.pop("OPENAI_API_KEY", None)
+        if not azure_configured() and not ctx.local_only:
+            errors.append(
+                "Missing LLM credentials: set openai_key in config.yml's tokens, "
+                "or configure Azure with AZURE_OPENAI_ENDPOINT + "
+                "AZURE_OPENAI_API_KEY there"
+            )
 
     # Only needed for the gemini PR-rubrics path; not a hard requirement
     # otherwise, so this is a warning, not an error.
     gemini_key = ctx.tokens.get(GEMINI_TOKEN_NAME, "").strip()
-    if gemini_key and not os.environ.get("GEMINI_API_KEY", "").strip():
+    if gemini_key:
         os.environ["GEMINI_API_KEY"] = gemini_key
+    else:
+        os.environ.pop("GEMINI_API_KEY", None)
     if ctx.pr_rubrics_provider == "gemini" and not os.environ.get("GEMINI_API_KEY", "").strip():
         log.error(
             f"--pr-rubrics-provider=gemini but no GEMINI_API_KEY is set "

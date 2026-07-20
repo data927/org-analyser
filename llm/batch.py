@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -44,6 +45,24 @@ DEFAULT_BATCH_THRESHOLD = 50
 DEFAULT_MAX_WORKERS = 8
 
 TERMINAL_BATCH_STATUSES = ("completed", "failed", "expired", "cancelled")
+
+
+def _batch_endpoint() -> str:
+    """Batch input `url` / `batches.create` endpoint. Azure OpenAI serves batch
+    under the deployment-relative "/chat/completions"; OpenAI under "/v1/...".
+    Mirrors llm_safety.safe_openai's Azure switch (AZURE_OPENAI_ENDPOINT set)."""
+    if os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip():
+        return "/chat/completions"
+    return "/v1/chat/completions"
+
+
+def _batch_model(model: str) -> str:
+    """Azure Batch indexes by deployment name, not model name -- swap it in
+    here (same mapping safe_openai applies to live calls via kwargs)."""
+    deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "").strip()
+    if deployment and os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip():
+        return deployment
+    return model
 
 
 @dataclass
@@ -79,14 +98,14 @@ def _redact_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
 
 def _to_jsonl_line(item: BatchItem) -> str:
     body: dict[str, Any] = {
-        "model": item.model,
+        "model": _batch_model(item.model),
         "messages": _redact_messages(item.messages),
         "temperature": item.temperature,
     }
     if item.response_format:
         body["response_format"] = item.response_format
     return json.dumps(
-        {"custom_id": item.custom_id, "method": "POST", "url": "/v1/chat/completions", "body": body}
+        {"custom_id": item.custom_id, "method": "POST", "url": _batch_endpoint(), "body": body}
     )
 
 
@@ -151,7 +170,7 @@ def run_batch_chunk(
         with input_path.open("rb") as fh:
             upload = client.files.create(file=fh, purpose="batch")
         batch = client.batches.create(
-            input_file_id=upload.id, endpoint="/v1/chat/completions", completion_window="24h"
+            input_file_id=upload.id, endpoint=_batch_endpoint(), completion_window="24h"
         )
         batch_id = batch.id
         state = {
@@ -318,3 +337,29 @@ def run_batch_or_sync(
             except Exception as exc:
                 results.append(BatchItemResult(item.custom_id, False, None, str(exc), item.metadata))
     return results
+
+
+def _demo() -> None:
+    """Self-check: the JSONL request must switch URL/model between OpenAI and
+    Azure so batch works on both providers."""
+    item = BatchItem(custom_id="c0", messages=[{"role": "user", "content": "hi"}], model="gpt-4o")
+
+    for var in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT"):
+        os.environ.pop(var, None)
+    row = json.loads(_to_jsonl_line(item))
+    assert row["url"] == "/v1/chat/completions", row["url"]
+    assert row["body"]["model"] == "gpt-4o", row["body"]["model"]
+
+    os.environ["AZURE_OPENAI_ENDPOINT"] = "https://x.openai.azure.com/"
+    os.environ["AZURE_OPENAI_DEPLOYMENT"] = "gpt4o-batch"
+    row = json.loads(_to_jsonl_line(item))
+    assert row["url"] == "/chat/completions", row["url"]
+    assert row["body"]["model"] == "gpt4o-batch", row["body"]["model"]
+
+    for var in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT"):
+        os.environ.pop(var, None)
+    print("ok")
+
+
+if __name__ == "__main__":
+    _demo()

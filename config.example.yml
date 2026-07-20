@@ -12,8 +12,15 @@ tokens:
   gitlab_token: null        # read_api PAT -- for --gitlab-group / --gitlab-project
   bitbucket_token: null     # workspace/repo access token; optional for a public repo
   bitbucket_username: null  # only for Bitbucket app-password auth
-  openai_key: null          # or set OPENAI_API_KEY / AZURE_OPENAI_* in the environment
+  openai_key: null          # OpenAI key (leave null if using Azure below)
   gemini_key: null          # only if pr_rubrics_provider: gemini below
+  # Azure OpenAI (chat + batch). Set these instead of openai_key to route the
+  # LLM phases through Azure. Credentials come from config.yml ONLY -- matching
+  # env vars are ignored, so keep every key here.
+  AZURE_OPENAI_ENDPOINT: null    # https://<resource>.openai.azure.com/
+  AZURE_OPENAI_API_KEY: null
+  AZURE_OPENAI_DEPLOYMENT: null  # deployment name if it differs from the model
+  OPENAI_API_VERSION: null       # e.g. 2024-10-21 (defaults if unset)
 
 # --- run target: set exactly one (or pass the matching CLI flag instead) ---
 github_org: null
