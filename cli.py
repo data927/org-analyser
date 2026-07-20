@@ -1179,12 +1179,16 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         args.append("--skip-quality-llm")
         args.append("--skip-pr-rubrics")
     args.extend(["--pr-rubrics-provider", ctx.pr_rubrics_provider])
-    # Pipeline eval-kit runs use live chat.completions for taxonomy and
-    # PR-rubrics rather than the Batch API: each repo is a separate subprocess
-    # with its own timeout, so a 24h batch queue would stall the whole
-    # per-repo pool and guarantee a timeout kill.
-    args.extend(["--taxonomy-llm-mode", "sync"])
-    args.extend(["--rubrics-llm-mode", "sync"])
+    # No longer forcing sync: auto is already the evaluator's own default,
+    # so large candidate sets route to the OpenAI Batch API like everywhere
+    # else in the shared broker. This reopens the trade-off the old sync
+    # override existed to avoid: repo_pool workers running run_eval_kit can
+    # now sit on one repo's batch job for up to the timeout below instead of
+    # being killed after 2h, so a run with more large repos than workers can
+    # have the pool pinned for a long time. Accepted trade-off: correctness
+    # (don't kill a valid batch) over per-repo throughput.
+    args.extend(["--taxonomy-llm-mode", "auto"])
+    args.extend(["--rubrics-llm-mode", "auto"])
 
     extra_env: dict[str, str] = {}
     if token:
@@ -1198,7 +1202,14 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
         "eval.repo_evaluator",
         args,
         extra_env=extra_env or None,
-        timeout=7200,
+        # Eval-kit can run up to three sequential Batch API jobs (rubrics
+        # inference, rubrics scoring, taxonomy), each with a 24-hour
+        # completion window. Do not kill a valid batch before it completes.
+        # A failed batch call falls back to live sync for the whole item
+        # set (llm.batch.run_batch_or_sync), which for a very large repo
+        # could itself run long and push wall-clock past this budget; the
+        # 5-minute buffer only covers clean completion, not that fallback.
+        timeout=3 * 24 * 60 * 60 + 300,
         cwd=CODING,
         # The slowest, most opaque phase: stream its output live so a run on a
         # 1000+-PR repo can be watched with `tail -f` instead of looking hung.

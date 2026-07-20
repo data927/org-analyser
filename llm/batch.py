@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 # headroom for JSONL formatting overhead this estimate doesn't account for.
 MAX_REQUESTS_PER_CHUNK = 50_000
 MAX_BYTES_PER_CHUNK = 190 * 1024 * 1024
+# Shared routing policy: a handful of requests returns quickly over live chat;
+# larger workloads use the OpenAI Batch API.
+DEFAULT_BATCH_THRESHOLD = 50
+# Shared sync-path fallback pool size, used by every run_batch_or_sync call site.
+DEFAULT_MAX_WORKERS = 8
 
 TERMINAL_BATCH_STATUSES = ("completed", "failed", "expired", "cancelled")
 
@@ -273,8 +278,8 @@ def run_batch_or_sync(
     tag: str,
     sync_fn: Callable[[BatchItem], BatchItemResult],
     mode: str = "auto",
-    threshold: int = 50,
-    max_workers: int = 8,
+    threshold: int = DEFAULT_BATCH_THRESHOLD,
+    max_workers: int = DEFAULT_MAX_WORKERS,
     **batch_kwargs: Any,
 ) -> list[BatchItemResult]:
     """Single entry point call sites should use instead of a raw per-item

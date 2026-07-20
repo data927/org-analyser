@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-from llm.batch import BatchItem, BatchItemResult, run_batch_or_sync
+from llm.batch import (
+    DEFAULT_BATCH_THRESHOLD,
+    DEFAULT_MAX_WORKERS,
+    BatchItem,
+    BatchItemResult,
+    run_batch_or_sync,
+)
 from llm.credential_redactor import redact_diff, redact_secrets, redaction_summary
 from llm.llm_safety import safe_gemini, safe_openai
 
@@ -557,8 +563,8 @@ class QualityEvaluator:
         batch_work_dir: Optional[Path] = None,
         tag: str = "rubrics",
         llm_mode: str = "auto",
-        llm_batch_threshold: int = 50,
-        max_workers: int = 8,
+        llm_batch_threshold: int = DEFAULT_BATCH_THRESHOLD,
+        max_workers: int = DEFAULT_MAX_WORKERS,
     ) -> List[Tuple[bool, Optional[QualityScores], Optional[str]]]:
         """Score a whole repo's accepted PRs through llm.batch's
         run_batch_or_sync instead of one live call at a time: below the

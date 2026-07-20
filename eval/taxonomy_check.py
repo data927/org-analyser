@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 from eval.task_taxonomy.classify import TaxonomyClassifier
+from llm.batch import DEFAULT_BATCH_THRESHOLD, DEFAULT_MAX_WORKERS
 
 logger = logging.getLogger(__name__)
 
@@ -329,10 +330,10 @@ def run_taxonomy_for_accepted_prs(
     base_url: str = "https://api.openai.com/v1",
     skip_taxonomy: bool = False,
     pr_number: int | None = None,
-    concurrency: int = 8,
+    concurrency: int = DEFAULT_MAX_WORKERS,
     batch_work_dir: Path | None = None,
     llm_mode: str = "auto",
-    llm_batch_threshold: int = 50,
+    llm_batch_threshold: int = DEFAULT_BATCH_THRESHOLD,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """
     Classify each accepted PR; aggregate successful rows into repo-level columns.

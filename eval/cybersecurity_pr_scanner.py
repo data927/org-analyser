@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 
 from platforms.github import github_headers
 from platforms.github import paginate as github_platform_paginate
+from llm.batch import DEFAULT_BATCH_THRESHOLD, DEFAULT_MAX_WORKERS
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=False)
 
@@ -358,7 +359,7 @@ def scan_repo(
     fetch_files: bool,
     batch_work_dir: Optional[Path] = None,
     llm_mode: str = "auto",
-    llm_batch_threshold: int = 50,
+    llm_batch_threshold: int = DEFAULT_BATCH_THRESHOLD,
 ) -> Dict[str, Any]:
     full_name = f"{owner}/{repo}"
     logger.info(
@@ -625,8 +626,8 @@ def run_layer2_llm_batch(
     work_dir: Path,
     tag: str,
     mode: str = "auto",
-    threshold: int = 50,
-    max_workers: int = 8,
+    threshold: int = DEFAULT_BATCH_THRESHOLD,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> Dict[int, Layer2Result]:
     """Batch Layer2 across every Layer1-passing PR in one repo scan, instead
     of one live chat.completions.create call per PR. Each entry in

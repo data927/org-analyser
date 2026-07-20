@@ -92,7 +92,7 @@ from platforms.gitlab import paginate as gitlab_platform_paginate
 
 # Shared redacting OpenAI client. This script sends PR titles, bodies and human
 # review comments, so it must not construct a bare OpenAI() client.
-from llm.batch import BatchItem, BatchItemResult, run_batch_or_sync
+from llm.batch import DEFAULT_BATCH_THRESHOLD, BatchItem, BatchItemResult, run_batch_or_sync
 from llm.llm_safety import llm_available, safe_openai
 
 try:
@@ -1469,7 +1469,7 @@ def process_prs(
     client: Any = None,
     batch_work_dir: Optional[Path] = None,
     llm_mode: str = "auto",
-    llm_batch_threshold: int = 50,
+    llm_batch_threshold: int = DEFAULT_BATCH_THRESHOLD,
 ) -> List[Dict[str, Any]]:
     if client is None:
         client = safe_openai()
