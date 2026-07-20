@@ -87,7 +87,7 @@ from platforms.bitbucket import bitbucket_headers
 from platforms.bitbucket import paginate as bitbucket_platform_paginate
 from platforms.github import github_headers
 from platforms.github import paginate as github_platform_paginate
-from platforms.gitlab import gitlab_headers
+from platforms.gitlab import gitlab_api, gitlab_headers
 from platforms.gitlab import paginate as gitlab_platform_paginate
 
 # Shared redacting OpenAI client. This script sends PR titles, bodies and human
@@ -110,7 +110,6 @@ except Exception:  # pragma: no cover - dotenv is optional
 VERSION = "1.2.1"
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 GITHUB_REST_URL = "https://api.github.com"
-GITLAB_REST_URL = "https://gitlab.com/api/v4"
 BITBUCKET_REST_URL = "https://api.bitbucket.org/2.0"
 DEFAULT_MODEL = "gpt-4o-mini"
 CATEGORIES = ["simple_fix", "standard_feature_work", "rich_task", "other"]
@@ -489,10 +488,11 @@ def gitlab_rest_get(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     max_retries: int = 8,
+    gitlab_host: str = "gitlab.com",
 ) -> Any:
     session = requests.Session()
     session.headers.update(gitlab_headers(token))
-    url = f"{GITLAB_REST_URL}{path}"
+    url = f"{gitlab_api(gitlab_host)}{path}"
     response = request_with_retry(session, "GET", url, params=params, max_retries=max_retries)
     if response is None:
         raise RuntimeError(f"GitLab REST request failed (not found, no access, or exhausted retries): {url}")
@@ -505,10 +505,11 @@ def gitlab_rest_paginated(
     token: str,
     path: str,
     params: Optional[Dict[str, Any]] = None,
+    gitlab_host: str = "gitlab.com",
 ) -> List[Any]:
     session = requests.Session()
     session.headers.update(gitlab_headers(token))
-    url = f"{GITLAB_REST_URL}{path}"
+    url = f"{gitlab_api(gitlab_host)}{path}"
     return gitlab_platform_paginate(session, url, params=params)
 
 
@@ -516,6 +517,7 @@ def list_gitlab_group_projects(
     token: str,
     group: str,
     include_archived: bool,
+    gitlab_host: str = "gitlab.com",
 ) -> List[str]:
     encoded_group = urllib.parse.quote(group, safe="")
     logger.info("Listing GitLab projects for group %s...", group)
@@ -527,6 +529,7 @@ def list_gitlab_group_projects(
             "archived": "true" if include_archived else "false",
             "order_by": "last_activity_at",
         },
+        gitlab_host=gitlab_host,
     )
     projects = [
         p["path_with_namespace"]
@@ -637,6 +640,7 @@ def fetch_merged_gitlab_mrs(
     project: str,
     sleep_seconds: float,
     checkpoint_dir: Optional[Path] = None,
+    gitlab_host: str = "gitlab.com",
 ) -> List[Dict[str, Any]]:
     encoded = urllib.parse.quote(project, safe="")
     slug = re.sub(r"[^A-Za-z0-9._-]", "_", f"gitlab_{project}")
@@ -663,6 +667,7 @@ def fetch_merged_gitlab_mrs(
         token,
         f"/projects/{encoded}/merge_requests",
         {"state": "merged", "order_by": "updated_at", "sort": "desc"},
+        gitlab_host=gitlab_host,
     )
 
     fetched = 0
@@ -673,10 +678,15 @@ def fetch_merged_gitlab_mrs(
         if int(iid) in done_iids:
             continue
 
-        changes = gitlab_rest_get(token, f"/projects/{encoded}/merge_requests/{iid}/changes")
+        changes = gitlab_rest_get(
+            token,
+            f"/projects/{encoded}/merge_requests/{iid}/changes",
+            gitlab_host=gitlab_host,
+        )
         notes = gitlab_rest_paginated(
             token,
             f"/projects/{encoded}/merge_requests/{iid}/notes",
+            gitlab_host=gitlab_host,
         )
         normalized = normalize_gitlab_mr(mr, changes, notes)
 
@@ -899,6 +909,7 @@ def resolve_gitlab_targets(
     group_args: Optional[List[str]],
     project_args: Optional[List[str]],
     include_archived: bool,
+    gitlab_host: str = "gitlab.com",
 ) -> List[str]:
     projects: List[str] = []
     seen = set()
@@ -910,7 +921,9 @@ def resolve_gitlab_targets(
             projects.append(path)
 
     for group in _split_csv_args(group_args):
-        for path in list_gitlab_group_projects(token, group, include_archived):
+        for path in list_gitlab_group_projects(
+            token, group, include_archived, gitlab_host=gitlab_host
+        ):
             add(path)
 
     for project in _split_csv_args(project_args):
@@ -1837,6 +1850,12 @@ def main() -> None:
         "--bitbucket-repo", action="append", default=None,
         help="Bitbucket repo path (workspace/repo). Repeatable / comma-separated.",
     )
+    parser.add_argument(
+        "--gitlab-host",
+        default=os.environ.get("GITLAB_HOST", "gitlab.com"),
+        help="GitLab host (e.g. gitlab.com or gitlab.example.com). "
+             "Also read from GITLAB_HOST env var.",
+    )
     parser.add_argument("--include-archived", action="store_true",
                         help="Include archived repos when expanding an org/user.")
     parser.add_argument("--no-forks", dest="include_forks", action="store_false",
@@ -1896,7 +1915,7 @@ def main() -> None:
     logger.info("PR Task-Profile Report v%s", VERSION)
     logger.info("run_id        : %s", run_id)
     logger.info("targets       : repo=%s org=%s user=%s", args.repo, args.org, args.user)
-    logger.info("gitlab        : group=%s project=%s", args.gitlab_group, args.gitlab_project)
+    logger.info("gitlab        : group=%s project=%s host=%s", args.gitlab_group, args.gitlab_project, args.gitlab_host)
     logger.info("llm model     : %s", args.model)
     logger.info("page size     : %s", args.page_size)
     logger.info("max workers   : %s", args.max_workers)
@@ -1948,6 +1967,7 @@ def main() -> None:
                 group_args=args.gitlab_group,
                 project_args=args.gitlab_project,
                 include_archived=args.include_archived,
+                gitlab_host=args.gitlab_host,
             )
             scan_targets.extend(("gitlab", p) for p in gitlab_projects)
         except Exception as exc:  # noqa: BLE001
@@ -2008,6 +2028,7 @@ def main() -> None:
                     project=repo,
                     sleep_seconds=args.sleep,
                     checkpoint_dir=Path(args.output_dir) / "checkpoints",
+                    gitlab_host=args.gitlab_host,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to fetch PRs for %s: %s", repo, exc)

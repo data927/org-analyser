@@ -47,7 +47,7 @@ python: null                  # interpreter for subprocess phases; null = auto-d
 tokens_file: null              # key=value file instead of the tokens: map above
 repos_manifest: null            # folder_name -> owner/repo map, for --local-repos-dir + PR data
 github_host: github.com
-gitlab_host: gitlab.com
+gitlab_host: gitlab.com        # self-hosted: gitlab.example.com or https://gitlab.example.com
 github_token_name: github-data-token
 pr_rubrics_provider: openai   # or "gemini" (needs gemini_key above)
 local_only: false             # never contact a remote API, even if a checkout has 'origin'

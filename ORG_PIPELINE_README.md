@@ -13,6 +13,10 @@ One command runs analysis pipelines for **one GitHub org**, **one GitLab group/p
 Output is a timestamped run folder and a **zip** containing all reports and logs.
 
 Setup, tokens, and run examples: see the root [`README.md`](./README.md).
+For **self-hosted GitLab**, set `gitlab_host` in `config.yml` or pass
+`--gitlab-host` on every run (including `org-analyser check`). Without it,
+API calls and clones default to gitlab.com and tokens from your instance will
+401.
 There are **no** `--limit`/`--max-repos`/`--max-prs` options — every discovered
 repo is processed. This doc covers what a run actually does internally.
 
@@ -102,6 +106,7 @@ outputs/org-analyser-runs/
 |-------|----------------|
 | Script exits immediately | LLM credential missing; required platform token missing |
 | Clone failures | Token scopes; repo access; logs in `logs/.../clone.log` |
+| GitLab 401 / wrong host | `gitlab_host` in `config.yml` or `--gitlab-host` must match your instance, not gitlab.com |
 | Profiler warnings | Install `scc` and Node.js; see profiler log |
 | Repo-analyzer failures | Repo log under `repo-analyzer.log`; runs local-only, no token needed |
 | Eval-kit failures | LLM credential valid; repo log under `eval-kit.log` |

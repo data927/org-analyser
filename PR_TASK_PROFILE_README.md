@@ -48,6 +48,11 @@ pass is mandatory.
 |------|---------|
 | Whole group (incl. subgroups) | `--gitlab-group my-group` |
 | Single project | `--gitlab-project group/project` |
+| Self-hosted instance | add `--gitlab-host gitlab.example.com` (hostname or full `https://` URL) |
+
+For self-hosted GitLab, `--gitlab-host` is required unless you export
+`GITLAB_HOST` or run through `org-analyser`, which reads `gitlab_host` from
+`config.yml`.
 
 ### Bitbucket targets
 
@@ -71,6 +76,11 @@ python3 -m analysis.pr_task_profile --org your-org --page-size 50 --max-workers 
 # GitLab group
 python3 -m analysis.pr_task_profile --gitlab-group my-group --max-workers 16 --sleep 0.3
 
+# Self-hosted GitLab project
+python3 -m analysis.pr_task_profile \
+  --gitlab-project my-group/my-backend \
+  --gitlab-host gitlab.example.com
+
 # Bitbucket repos
 python3 -m analysis.pr_task_profile --bitbucket-repo my-workspace/frontend --bitbucket-repo my-workspace/backend
 
@@ -89,6 +99,7 @@ python3 -m analysis.pr_task_profile --org your-org --repo your-org/mobile-app
 | `--user` | — | GitHub user login. Repeatable / comma-separated. |
 | `--gitlab-group` | — | GitLab group path. Repeatable / comma-separated. |
 | `--gitlab-project` | — | GitLab project path. Repeatable / comma-separated. |
+| `--gitlab-host` | `GITLAB_HOST` env, else `gitlab.com` | GitLab hostname or base URL (self-hosted instances). |
 | `--bitbucket-repo` | — | Bitbucket `workspace/repo` path. Repeatable / comma-separated. |
 | `--include-archived` | off | Include archived repos/projects. |
 | `--no-forks` / `--include-forks` | forks excluded | Fork handling for GitHub expansion. |
@@ -162,6 +173,7 @@ Checkpoints are stored under `<output-dir>/checkpoints/` so interrupted runs can
 | Symptom | Fix |
 |---------|-----|
 | Token not set | Export `GITHUB_TOKEN`, `GITLAB_TOKEN`, `BITBUCKET_TOKEN`, or `OPENAI_API_KEY`. |
+| GitLab 401 on gitlab.com | Token is from a self-hosted instance — set `--gitlab-host` or `GITLAB_HOST`. Check the log line `host=...`. |
 | Bitbucket "Token is invalid" | Atlassian API tokens (`ATATT…`) need `BITBUCKET_USERNAME` set to your Atlassian account **email**, not username. |
 | GraphQL 502/503/504 | Lower `--page-size`, raise `--sleep`; script retries automatically. |
 | Rate limits | Lower `--max-workers`, raise `--sleep`. |

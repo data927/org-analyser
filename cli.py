@@ -1444,6 +1444,8 @@ def run_pr_task_profile(
         str(ctx.task_profile_dir),
         "--max-workers",
         str(min(ctx.workers, 6)),
+        "--gitlab-host",
+        ctx.gitlab_host,
     ]
 
     if ctx.platform == "github":

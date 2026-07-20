@@ -34,18 +34,39 @@ optionally a default target so `org-analyser` runs with zero flags.
 | Token | Where to get it |
 |---|---|
 | `github-data-token` | [github.com/settings/tokens](https://github.com/settings/tokens) (classic, `repo` scope) |
-| `gitlab_token` | [gitlab.com/-/user_settings/personal_access_tokens](https://gitlab.com/-/user_settings/personal_access_tokens) (`read_api`) |
+| `gitlab_token` | Personal access token with `read_api` from your GitLab instance — [gitlab.com](https://gitlab.com/-/user_settings/personal_access_tokens) or your self-hosted **Profile → Access tokens** page |
 | `bitbucket_token` | app password / access token / API token — see `profiler/README.md`; optional for public repos |
-| `openai_key` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (or `OPENAI_API_KEY`/`AZURE_OPENAI_*` env) |
+| `openai_key` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) — or use Azure below instead |
+| `AZURE_OPENAI_*` | For Azure OpenAI (chat **and** batch): set `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and `AZURE_OPENAI_DEPLOYMENT` under `tokens:` instead of `openai_key` |
+
+Set `gitlab_host` in `config.yml` (or pass `--gitlab-host`) when your repos
+live on a **self-hosted GitLab** instance instead of gitlab.com. Use the
+hostname only (`gitlab.example.com`) or a full base URL
+(`https://gitlab.example.com`). Every GitLab phase — repo discovery, merged-PR
+counts, cloning, PR task-profile, and eval — uses this host.
+
+```yaml
+gitlab_group: my-group          # or gitlab_project: ["my-group/repo-a"]
+gitlab_host: gitlab.example.com # not gitlab.com
+tokens:
+  gitlab_token: glpat-...
+```
+
+Credentials are read from `config.yml` **only** — matching environment variables
+(`OPENAI_API_KEY`, `AZURE_OPENAI_*`, etc.) are deliberately ignored, so keep
+every key in `config.yml`.
 
 Then validate before spending real time on a run:
 
 ```bash
 org-analyser check --github-org <ORG_NAME>
+org-analyser check --gitlab-group <GROUP> --gitlab-host gitlab.example.com
 ```
 
 Checks tokens, tools, disk space, clone auth, and the LLM endpoint live, and
-aborts with zero clones made if anything's wrong.
+aborts with zero clones made if anything's wrong. For self-hosted GitLab, pass
+the same `--gitlab-host` you use for the real run (or set `gitlab_host` in
+`config.yml` so check picks it up automatically).
 
 ## Run
 
@@ -54,11 +75,16 @@ org-analyser --github-org <ORG_NAME> --workers 10        # whole org
 org-analyser --github-repo <OWNER>/<REPO>                 # single repo
 org-analyser --local-repos-dir ./repos --workers 4         # local checkouts
 org-analyser --github-org <ORG_NAME> --skip-pr-task-profile # skip only the PR task-profile phase
+
+# Self-hosted GitLab (set gitlab_host in config.yml to avoid repeating the flag)
+org-analyser --gitlab-group <GROUP> --gitlab-host gitlab.example.com
+org-analyser --gitlab-project <GROUP>/<PROJECT> --gitlab-host gitlab.example.com
 ```
 
 Same flags work for `--gitlab-group`/`--gitlab-project` and
 `--bitbucket-workspace`/`--bitbucket-repo`. Any flag can be set as a default
-in `config.yml` instead. `org-analyser run --help` lists everything else
+in `config.yml` instead — including `gitlab_host` for self-hosted instances.
+`org-analyser run --help` lists everything else
 (retries, clone depth, skip flags, etc.) — most runs don't need them.
 
 ## If a run fails
@@ -98,8 +124,9 @@ otherwise (the run is still resumable — rerun the same command, or
 
 ## Troubleshooting
 
-- **`SSL: CERTIFICATE_VERIFY_FAILED`** — fixed via `certifi`; rerun after `pip install -e .`.
+- **`SSL: CERTIFICATE_VERIFY_FAILED`** — fixed via `certifi`; rerun after `pip install -e .`. Self-hosted GitLab with a private CA may still need your system trust store configured.
 - **Auth / 404** — check the token's access and the `owner/repo` spelling; `org-analyser check` catches this before a real run.
+- **GitLab 401 against `gitlab.com`** — your token is for a self-hosted instance but `gitlab_host` is still the default. Set `gitlab_host` in `config.yml` or pass `--gitlab-host gitlab.example.com`. The PR task-profile log line `host=gitlab.com` is the tell.
 - **Config not picked up** — run from the repo root, or set `ORG_ANALYSER_CONFIG=/path/to/config.yml`.
 
 ## More docs
