@@ -1700,7 +1700,8 @@ class LocalProvider:
 
 def analyze_project(prov, project_id, max_mrs, sample_mrs,
                     max_test_files, workers=8, max_commit_scan=0,
-                    max_ai_file_scan=0, max_quality_scan=0):
+                    max_ai_file_scan=0, max_quality_scan=0,
+                    known_merged_count=None):
     info = prov.project_info(project_id)
     if info is None:
         print(f"  Project not found: {project_id}")
@@ -1762,6 +1763,29 @@ def analyze_project(prov, project_id, max_mrs, sample_mrs,
     # MR categorization — sample_mrs=0 means ALL will be deep-analyzed
     if mrs:
         _categorize_mrs(prov, info, mrs, sample_mrs, workers, result)
+
+    if known_merged_count is not None and prov.kind == "local":
+        # git-history traces are a floor estimate (squash/rebase merges
+        # leave none) -- when the caller already knows the real count from
+        # the platform API, trust that instead. Any % breakdown above was
+        # computed from the (possibly very different-sized) locally
+        # detected sample, so it no longer describes the corrected total —
+        # blank it rather than show a misleading split.
+        detected = len(mrs)
+        result["total_mrs"] = known_merged_count
+        result["merged_mrs"] = known_merged_count
+        if detected != known_merged_count:
+            for key in ("pct_simple", "pct_standard", "pct_rich",
+                        "pct_automated", "pct_other", "avg_loc_per_mr"):
+                result[key] = ""
+            result["mr_sample_size"] = 0
+            result["mrs_note"] = (
+                f"count corrected via platform API ({known_merged_count} "
+                f"merged); git-history heuristic detected {detected} -- "
+                "breakdown n/a for the corrected total"
+            )
+        else:
+            result["mrs_note"] = f"count confirmed via platform API ({known_merged_count} merged)"
 
     # Fetch the file tree only once (used by files/CI/tests and LLM detection)
     print("  Repository file tree...")
@@ -2762,6 +2786,11 @@ def main():
                          "explicit #N/!N refs (default) | strict = only "
                          "explicit refs | merges = also all merge commits | "
                          "off = MR fields blank")
+    ap.add_argument("--known-merged-count", type=int, default=None,
+                    help="Override # of MRs/PRs / # of Merged for --provider "
+                         "local with an already-known accurate count (e.g. "
+                         "from the platform API) instead of the git-history "
+                         "estimate. Single-project (--path) use only.")
     ap.add_argument("--output", default="repo_report.csv")
     args = ap.parse_args()
 
@@ -2788,6 +2817,10 @@ def main():
         projects += gp
         print(f"  found {len(gp)} projects")
 
+    # --known-merged-count describes exactly one repo -- never apply it
+    # across a --group/--org batch of projects.
+    known_merged_count = args.known_merged_count if len(projects) == 1 else None
+
     results = []
     detail = os.path.splitext(args.output)[0] + "_detail.json"
     for p in projects:
@@ -2796,7 +2829,8 @@ def main():
                                 args.max_test_files, workers=args.workers,
                                 max_commit_scan=args.max_commit_scan,
                                 max_ai_file_scan=args.max_ai_file_scan,
-                                max_quality_scan=args.max_quality_scan)
+                                max_quality_scan=args.max_quality_scan,
+                                known_merged_count=known_merged_count)
             if r:
                 results.append(r)
                 # Save detail after every project — crash-safe

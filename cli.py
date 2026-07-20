@@ -154,6 +154,9 @@ sys.path.insert(0, str(CODING))
 from analysis.merged_prs import (  # noqa: E402
     CSV_FIELDS,
     SUMMARY_FIELDS,
+    count_bitbucket_merged,
+    count_github_merged,
+    count_gitlab_merged,
     export_bitbucket_repos,
     export_bitbucket_workspace,
     export_github_org,
@@ -1223,9 +1226,41 @@ def run_eval_kit(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[b
     return True, f"eval-kit ok -> {out_json}"
 
 
+def _known_merged_count(entry: RepoEntry, ctx: RunContext) -> int | None:
+    """The real merged-PR count from the platform API, for repo-analyzer's
+    --known-merged-count -- its own git-history heuristic (--provider local)
+    is a floor estimate that can be wildly off (squash/rebase merges leave
+    no trace; long-lived branches merged outside any PR/MR inflate it).
+    One cheap, already-proven-safe API call (same pattern codebase-profiler
+    uses for its own PR-count column). Returns None (no override) for local
+    checkouts or on any lookup failure -- the heuristic stays as a fallback."""
+    if entry.is_local:
+        return None
+    try:
+        if entry.platform == "github":
+            token = ctx.tokens.get(ctx.github_token_name, "")
+            if not token:
+                return None
+            return count_github_merged(token, entry.full_name, ctx.github_host, None, None)
+        if entry.platform == "gitlab":
+            token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
+            if not token:
+                return None
+            return count_gitlab_merged(token, entry.full_name, ctx.gitlab_host, None, None)
+        if entry.platform == "bitbucket":
+            token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
+            if not token:
+                return None
+            username = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "")
+            return count_bitbucket_merged(token, entry.full_name, username, None, None)
+    except Exception:
+        return None
+    return None
+
+
 def run_repo_analyzer(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tuple[bool, str]:
     """LLM-usage / training-data-quality / CI report, run against the local
-    clone (no extra API calls — same clone the other phases already use)."""
+    clone (no extra clone -- same clone the other phases already use)."""
     out_dir = ctx.repo_analyzer_dir / entry.batch_org / entry.short_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / f"{entry.short_name}.csv"
@@ -1236,6 +1271,9 @@ def run_repo_analyzer(entry: RepoEntry, clone_path: Path, ctx: RunContext) -> tu
         "--name", entry.full_name,
         "--output", str(out_csv),
     ]
+    known_merged = _known_merged_count(entry, ctx)
+    if known_merged is not None:
+        args += ["--known-merged-count", str(known_merged)]
     code, out, err = run_module(
         "analysis.repo_analyzer",
         args,
@@ -2277,7 +2315,20 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
 
     try:
         preflight(ctx, log)
-        entries = discover_repos(ctx, log)
+
+        log.info("Sanity check: connectivity, git auth, LLM reachability...")
+        sanity_ok, sanity_results, entries = run_sanity_checks(ctx, log, args.output_dir)
+        for name, passed, detail in sanity_results:
+            (log.info if passed else log.error)(f"  [{'PASS' if passed else 'FAIL'}] {name}: {detail}")
+        if not sanity_ok:
+            log.error("Sanity check failed -- aborting before any phase started. Fix the above and retry.")
+            ctx.manifest["error"] = "sanity check failed"
+            ctx.manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+            (ctx.run_dir / "manifest.json").write_text(
+                json.dumps(ctx.manifest, indent=2), encoding="utf-8"
+            )
+            return 1
+
         ctx.manifest["repo_count"] = len(entries)
 
         # merged-pr-counts runs concurrently with the repo pool (it only reads
@@ -2802,20 +2853,13 @@ def _print_check_table(results: list[tuple[str, bool, str]]) -> bool:
     return all_ok
 
 
-def run_check(args: argparse.Namespace) -> int:
-    """`org-analyser check`: prove the run will complete before spending any
-    time on it. Deeper than preflight() (which only checks presence) -- this
-    makes live calls: list repos, git ls-remote one of them, ping the LLM
-    endpoint, check disk space. Any failure means abort with zero clones
+def run_sanity_checks(
+    ctx: RunContext, log: PipelineLogger, output_dir: str
+) -> tuple[bool, list[tuple[str, bool, str]], list[RepoEntry]]:
+    """Live checks shared by `org-analyser check` and by every `run`/`resume`
+    before any phase starts: list repos, git ls-remote one of them, ping the
+    LLM endpoint, check disk space. Any failure means abort with zero clones
     made and zero API quota burned on the real phases."""
-    print_transparency_banner(args.local_only)
-    include_quality_score = not args.skip_quality_score
-    ctx = build_run_context(args, include_quality_score=include_quality_score)
-
-    check_dir = Path(args.output_dir).expanduser().resolve() / ".check"
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log = PipelineLogger(check_dir / f"check-{stamp}.log")
-
     results: list[tuple[str, bool, str]] = []
 
     def check(name: str, fn: Callable[[], str]) -> None:
@@ -2824,15 +2868,8 @@ def run_check(args: argparse.Namespace) -> int:
         except Exception as exc:
             results.append((name, False, f"{type(exc).__name__}: {exc}"))
 
-    try:
-        preflight(ctx, log)
-        results.append(("preflight (tokens/tools present)", True, "ok"))
-    except SystemExit:
-        results.append(("preflight (tokens/tools present)", False, "see errors logged above"))
-        return 0 if _print_check_table(results) else 1
-
     def _check_disk() -> str:
-        probe_dir = Path(args.output_dir).expanduser()
+        probe_dir = Path(output_dir).expanduser()
         usage = shutil.disk_usage(probe_dir if probe_dir.exists() else probe_dir.parent)
         free_gb = usage.free / (1024**3)
         if free_gb < 2:
@@ -2842,7 +2879,7 @@ def run_check(args: argparse.Namespace) -> int:
     check("disk space", _check_disk)
 
     def _check_output_dir() -> str:
-        d = Path(args.output_dir).expanduser().resolve()
+        d = Path(output_dir).expanduser().resolve()
         d.mkdir(parents=True, exist_ok=True)
         probe = d / ".org-analyser-write-test"
         probe.write_text("ok", encoding="utf-8")
@@ -2903,11 +2940,50 @@ def run_check(args: argparse.Namespace) -> int:
         if ctx.pr_rubrics_provider == "gemini":
             return "skipped (gemini live-check not implemented)"
         from llm.llm_safety import safe_openai  # noqa: WPS433
+        from analysis.pr_task_profile import DEFAULT_MODEL  # noqa: WPS433
 
-        safe_openai().models.list()
-        return "LLM endpoint reachable"
+        # A real completion call, not models.list() -- that only proves the
+        # key is authenticated, not that the account has completions quota.
+        # insufficient_quota comes back as a 429 here, same as the real
+        # per-PR calls pr-task-profile makes, so it's caught before any
+        # phase runs instead of 11+ calls deep into a real run.
+        safe_openai().chat.completions.create(
+            model=DEFAULT_MODEL,
+            temperature=0,
+            max_tokens=5,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        return f"LLM completion call succeeded (model={DEFAULT_MODEL})"
 
     check("LLM credentials live", _check_llm)
+
+    return all(ok for _, ok, _ in results), results, entries
+
+
+def run_check(args: argparse.Namespace) -> int:
+    """`org-analyser check`: prove the run will complete before spending any
+    time on it. Deeper than preflight() (which only checks presence) -- this
+    makes live calls via run_sanity_checks(). Any failure means abort with
+    zero clones made and zero API quota burned on the real phases."""
+    print_transparency_banner(args.local_only)
+    include_quality_score = not args.skip_quality_score
+    ctx = build_run_context(args, include_quality_score=include_quality_score)
+
+    check_dir = Path(args.output_dir).expanduser().resolve() / ".check"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log = PipelineLogger(check_dir / f"check-{stamp}.log")
+
+    results: list[tuple[str, bool, str]] = []
+
+    try:
+        preflight(ctx, log)
+        results.append(("preflight (tokens/tools present)", True, "ok"))
+    except SystemExit:
+        results.append(("preflight (tokens/tools present)", False, "see errors logged above"))
+        return 0 if _print_check_table(results) else 1
+
+    _, sanity_results, _entries = run_sanity_checks(ctx, log, args.output_dir)
+    results.extend(sanity_results)
 
     return 0 if _print_check_table(results) else 1
 
