@@ -732,11 +732,17 @@ def analyze_security(root: Path, source_files: list[tuple[Path, str]]) -> dict:
         if name == ".env" or (name.startswith(".env.") and "example" not in name.lower() and "sample" not in name.lower() and "template" not in name.lower()):
             env_committed.append(rel_path)
 
-    # Scan source (non-test) files for secrets, capping at 500 files to stay fast
-    scan_files = [(p, r) for p, r in source_files
-                  if p.suffix.lower() in CODE_EXTENSIONS
-                  and not is_test_file(r)
-                  and ".env" not in r][:500]
+    # Scan source (non-test) files for secrets, capping at 500 files to stay fast.
+    # Sort by relative path before capping so the sampled 500 are deterministic
+    # regardless of os.walk order — hardcoded_secret_hits is verified as an exact
+    # stable field, so an unstable sample would read as tampering on re-runs.
+    scan_files = sorted(
+        ((p, r) for p, r in source_files
+         if p.suffix.lower() in CODE_EXTENSIONS
+         and not is_test_file(r)
+         and ".env" not in r),
+        key=lambda pr: pr[1],
+    )[:500]
 
     for abs_path, rel_path in scan_files:
         try:

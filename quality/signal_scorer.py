@@ -25,8 +25,14 @@ def score_b(stats: dict) -> tuple[float, str]:
     ci_tests = bool(stats.get("ci_runs_tests"))
     fw = stats.get("test_framework") or []
 
-    if specs == 0:
-        return 5.0, f"no test specs found (framework={fw or 'none'})"
+    # Binary floor per dimension-catalog.md: "no framework, or <5 specs, ratio
+    # <1:50" all map to ~0 regardless of coverage tooling/CI — those only earn
+    # credit once there's a real test base to run them on.
+    if specs < 5 or (ratio is not None and ratio > 50):
+        return 5.0, (
+            f"{specs} spec files, ratio={stats.get('test_source_ratio')} "
+            f"(below rubric floor: <5 specs or ratio <1:50)"
+        )
     score = 20.0
     if ratio is not None:
         if ratio <= 3:
@@ -85,17 +91,20 @@ def score_d(stats: dict) -> tuple[float, str]:
     ptype = stats.get("project_type") or "unknown"
     fw = stats.get("detected_frameworks") or []
 
-    score = 35.0
+    # Base kept low: the 0-anchor is "no evidence of layering/typing/robustness
+    # at all," so absence of every signal below should land near the floor,
+    # not a generous midpoint the old 35 base gave every repo unconditionally.
+    score = 15.0
     if logging:
-        score += 15
+        score += 20
     if err:
-        score += 15
+        score += 20
     if health:
         score += 15
     if metrics:
         score += 10
     if fw:
-        score += 10
+        score += 20
     if ptype in ("library", "cli"):
         score = max(score, 45.0)
     return _clamp(score), (
@@ -108,6 +117,10 @@ def score_e(stats: dict) -> tuple[float, str]:
     lock_found = len(stats.get("lockfiles_found") or [])
     lock_exp = len(stats.get("lockfiles_expected") or [])
     update = stats.get("dep_update_tooling") or []
+    # repo_stats.py emits the literal string "none" (not None/empty) when no
+    # update tooling is detected — bool("none") is True, so a naive truthiness
+    # check here would credit every repo with update tooling it doesn't have.
+    has_update = bool(update) and update != "none"
     runtime = stats.get("direct_runtime_deps") or 0
 
     score = 20.0
@@ -115,7 +128,7 @@ def score_e(stats: dict) -> tuple[float, str]:
         score += 40 * (lock_found / lock_exp)
     elif lock_found:
         score += 25
-    if update:
+    if has_update:
         score += 15
     if runtime and runtime < 80:
         score += 10
@@ -179,12 +192,16 @@ def score_i(stats: dict) -> tuple[float, str]:
     validation = stats.get("input_validation_patterns") or []
     val_n = len(validation) if isinstance(validation, (list, tuple)) else int(validation or 0)
 
-    score = 70.0
-    score -= min(50, secrets * 15)
-    score -= min(30, len(env_committed) * 15)
-    if audit:
-        score += 15
-    score += min(15, val_n * 3)
+    # Binary cliff per dimension-catalog.md: any real secret in source, or a
+    # committed .env, floors the score to 0 regardless of validation/audit —
+    # those only matter once the repo has none.
+    if secrets or env_committed:
+        score = 0.0
+    else:
+        score = 50.0
+        score += min(35, val_n * 7)
+        if audit:
+            score += 15
     return _clamp(score), (
         f"secret_hits={secrets}, env_committed={len(env_committed)}, "
         f"dep_audit={audit}, validation_patterns={val_n}"
@@ -198,16 +215,18 @@ def score_k(git: dict) -> tuple[float, str]:
     conv = git.get("conventional_rate_last_200") or 0
     bot = git.get("bot_commit_ratio") or 0
 
-    score = 20.0
-    if recency is not None:
-        if recency <= 90:
-            score += 25
-        elif recency <= 365:
-            score += 15
-        elif recency <= 730:
-            score += 5
-        else:
-            score -= 10
+    # Recency is the rubric's lead signal at every anchor ("active in last 3
+    # months" / "6-18 months" / ">2 years ago"), so it sets the base tier
+    # rather than a flat +/-10 offset that author/tag bonuses could swamp.
+    stale = recency is not None and recency > 730
+    if recency is not None and recency <= 90:
+        score = 55.0
+    elif recency is not None and recency <= 365:
+        score = 40.0
+    elif stale:
+        score = 15.0
+    else:
+        score = 25.0
     if authors >= 10:
         score += 20
     elif authors >= 5:
@@ -220,6 +239,10 @@ def score_k(git: dict) -> tuple[float, str]:
         score += 8
     score += conv * 20
     score -= bot * 30
+    if stale:
+        # >2 years dead is disqualifying per the rubric's own 0-anchor — cap
+        # so a big contributor/tag count can't paper over a dead repo.
+        score = min(score, 25.0)
     return _clamp(score), (
         f"recency_days={recency}, human_authors={authors}, semver_tags={tags}, "
         f"conv_rate={conv:.2f}, bot_ratio={bot:.2f}"
