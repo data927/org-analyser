@@ -13,6 +13,7 @@ from quality.signal_scorer import (
     SCORERS,
     SPECIALIST,
     _clamp,
+    _n_signals,
     _parse_test_ratio,
     score_b,
     score_c,
@@ -32,14 +33,17 @@ def score_n_enhanced(stats: dict) -> tuple[float, str]:
     sql_files = cs.get("sql_file_count") or 0
     docker = bool(stats.get("has_dockerfile") or stats.get("has_docker_compose"))
     specs = stats.get("test_spec_files") or 0
+    pipeline, _dq = _n_signals(stats)
     base, ev = SCORERS["N"](stats) if "N" in SCORERS else (35.0, "")
     score = base
-    if sql_files:
-        score += min(20, sql_files * 2)
-    if docker:
-        score += 10
-    if specs >= 10:
-        score += 10
+    # Docker/test bonuses are pipeline-supporting signals — they only mean
+    # something once an orchestration backbone exists. SQL file volume alone
+    # is not pipeline quality (rubric 0-anchor) and earns nothing.
+    if pipeline:
+        if docker:
+            score += 10
+        if specs >= 10:
+            score += 10
     return _clamp(score), (
         f"{ev}; sql_files={sql_files}, sql_loc={sql_loc}, docker={docker}, specs={specs}"
     )

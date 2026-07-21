@@ -368,6 +368,51 @@ def compute(scores: dict) -> dict:
     return result
 
 
+def _find_evidence(evidence: dict) -> tuple[dict, dict]:
+    """Pick out the repo_stats and git_stats blobs from embedded evidence by shape
+    (filenames aren't guaranteed). repo_stats has 'demo_signals'/'class_signals';
+    git_stats nests repo-wide stats under 'repo_stats' and carries 'analyzed_commits'."""
+    repo_stats, git_stats = {}, {}
+    for blob in (evidence or {}).values():
+        if not isinstance(blob, dict):
+            continue
+        if "demo_signals" in blob or "class_signals" in blob:
+            repo_stats = blob
+        elif "analyzed_commits" in blob or ("repo_stats" in blob and isinstance(blob["repo_stats"], dict)):
+            git_stats = blob
+    return repo_stats, git_stats
+
+
+def detect_demo(repo_stats: dict, git_stats: dict) -> dict:
+    """Combine static name/README signals (repo_stats) with git 'burst-copy' history
+    (git_stats) into a demo/template verdict. A repo is flagged when >=2 independent
+    signal families agree, OR a README phrase is on its own conclusive (Weaveworks
+    Sock Shop, Create React App scaffold, RealWorld, a named demo app)."""
+    static = (repo_stats or {}).get("demo_signals", {}) or {}
+    gs = (git_stats or {}).get("repo_stats", {}) or {}
+
+    reasons, families = [], 0
+    if static.get("static_name_family"):
+        families += 1
+        reasons.append("demo/exercise name or known-demo app")
+    if static.get("static_content_family"):
+        families += 1
+        reasons.append("template README / default-scaffold fingerprint")
+    if gs.get("looks_like_burst_copy"):
+        families += 1
+        reasons.append("burst-copy git history (few same-day commits, no merges, <=2 authors)")
+
+    authoritative = bool(static.get("authoritative_demo"))
+    is_demo = authoritative or families >= 2
+    confidence = min(1.0, round(families / 3.0 + (0.34 if authoritative else 0.0), 2))
+    return {
+        "is_likely_demo": is_demo,
+        "demo_confidence": confidence if is_demo else 0.0,
+        "demo_reasons": reasons,
+        "demo_signal_families": families,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compute a class-aware 0-100 quality score for one repository."
@@ -392,17 +437,25 @@ def main() -> int:
 
     result = compute(scores)
 
+    # Load evidence up front (used for demo detection and, by default, embedded in
+    # the sealed bundle). Demo detection needs repo_stats + git_stats content.
+    evidence: dict = {}
+    for ev in args.evidence:
+        p = Path(ev)
+        if p.exists():
+            evidence[p.name] = sealing.load_json(p)
+        else:
+            sys.stderr.write(f"warning: evidence not found, skipping: {p}\n")
+
+    # Demo / template / exercise-copy verdict (does not change the quality score;
+    # consumed by aggregate_org.py for demo counts, mining exclusion, adjusted score).
+    repo_stats_ev, git_stats_ev = _find_evidence(evidence)
+    result.update(detect_demo(repo_stats_ev, git_stats_ev))
+
     # Seal by default: embed the result + raw-signal evidence + provenance + digest.
     if args.no_seal:
         output = result
     else:
-        evidence: dict = {}
-        for ev in args.evidence:
-            p = Path(ev)
-            if p.exists():
-                evidence[p.name] = sealing.load_json(p)
-            else:
-                sys.stderr.write(f"warning: evidence not found, skipping: {p}\n")
         if not evidence:
             sys.stderr.write(
                 "warning: no --evidence given; sealing with empty evidence "

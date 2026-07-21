@@ -108,12 +108,17 @@ def compute_raw_scores(stats: dict) -> dict[str, float]:
         + capped(n("ml_libs"), 1.0, 4.0)
     )
 
-    data_engineering = (
-        capped(n("data_eng"), 2.5, 9.0)
-        + capped(cs.get("sql_file_count", 0), 0.3, 4.0)
-        + capped(cs.get("sql_loc", 0) / 200.0, 1.0, 3.0)
-        + capped(cs.get("data_file_count", 0), 0.5, 2.0)
-    )
+    # SQL/data-file volume only corroborates data_engineering when at least one
+    # actual data-eng library (airflow/dbt/spark/...) is present. Without that,
+    # SQL files are almost always an app's schema migrations, and letting them
+    # score alone misclassifies ordinary webapps as data-engineering codebases.
+    data_engineering = capped(n("data_eng"), 2.5, 9.0)
+    if n("data_eng"):
+        data_engineering += (
+            capped(cs.get("sql_file_count", 0), 0.3, 4.0)
+            + capped(cs.get("sql_loc", 0) / 200.0, 1.0, 3.0)
+            + capped(cs.get("data_file_count", 0), 0.5, 2.0)
+        )
 
     security = capped(n("security_libs"), 3.0, 10.0)
 

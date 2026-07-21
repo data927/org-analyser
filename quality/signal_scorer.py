@@ -258,12 +258,33 @@ def score_m(stats: dict) -> tuple[float, str]:
     return _clamp(score), f"experiment_tracking={exp}, notebooks={notebooks}"
 
 
+# Data-validation tools within repo_stats' combined "data_eng" keyword list;
+# everything else in that list is orchestration/processing.
+_N_DATA_QUALITY = {"great-expectations", "great_expectations", "pandera"}
+
+
+def _n_signals(stats: dict) -> tuple[list, list]:
+    """Split repo_stats' single dep_keyword_hits["data_eng"] list into
+    (pipeline/orchestration, data-quality) — there are no separate
+    "pipeline_orchestration"/"data_quality" keys in the evidence."""
+    hits = (stats.get("class_signals") or {}).get("dep_keyword_hits") or {}
+    tools = hits.get("data_eng") or []
+    dq = [t for t in tools if t in _N_DATA_QUALITY]
+    pipeline = [t for t in tools if t not in _N_DATA_QUALITY]
+    return pipeline, dq
+
+
 def score_n(stats: dict) -> tuple[float, str]:
-    cs = stats.get("class_signals") or {}
-    hits = cs.get("dep_keyword_hits") or {}
-    pipeline = hits.get("pipeline_orchestration") or []
-    dq = hits.get("data_quality") or []
-    score = 30.0 + min(35, len(pipeline) * 12) + min(35, len(dq) * 12)
+    pipeline, dq = _n_signals(stats)
+    # Rubric 0-anchor: "ad-hoc scripts; no orchestration; no data validation"
+    # — with neither signal the score sits at the floor; SQL/script volume
+    # alone earns nothing.
+    if not pipeline and not dq:
+        return 10.0, "no orchestration or data-validation evidence"
+    score = 15.0
+    if pipeline:
+        score = 45.0 + min(15, (len(pipeline) - 1) * 8)
+    score += min(30, len(dq) * 15)
     return _clamp(score), f"pipeline={pipeline}, data_quality={dq}"
 
 
