@@ -337,8 +337,39 @@ def count_lines(path: Path, max_lines: int = 50_000) -> int:
         return 0
 
 
+SQL_DUMP_MARKERS = re.compile(
+    r"mysqldump|phpMyAdmin SQL Dump|pg_dump|SQLyog|Dumping data for table", re.I
+)
+# A data row inside an INSERT ... VALUES block: `(2, 'AL', 'Albania', 355),`
+SQL_TUPLE_LINE = re.compile(r"^\s*\(.*\)\s*[,;]?\s*$")
+
+
+def is_sql_dump(path: Path, sample_lines: int = 400) -> bool:
+    """Heuristic: is this .sql file a data dump / seed file rather than
+    hand-written DDL or queries? Catches both tool-generated dumps (header
+    marker) and hand-exported seed data (content dominated by INSERT value
+    tuples). These files can run to tens of thousands of lines and badly skew
+    LOC totals and the data_engineering class signal."""
+    if path.suffix.lower() != ".sql":
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [line for _, line in zip(range(sample_lines), f)]
+    except (OSError, PermissionError):
+        return False
+    if SQL_DUMP_MARKERS.search("".join(lines[:30])):
+        return True
+    stripped = [l for l in lines if l.strip()]
+    if len(stripped) < 50:
+        return False
+    tuples = sum(1 for l in stripped if SQL_TUPLE_LINE.match(l))
+    return tuples / len(stripped) > 0.5
+
+
 def is_generated(path: Path) -> bool:
     """Heuristic: is this a generated file?"""
+    if is_sql_dump(path):
+        return True
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             head = f.read(500)
@@ -946,6 +977,78 @@ def analyze_documentation(root: Path) -> dict:
     }
 
 
+# --- Demo / template / exercise-copy detection (static signals) --------------
+# Names that mark a scaffold/exercise/demo rather than original product work.
+_DEMO_NAME_RE = re.compile(
+    r"(?i)(^|[_\-/])("
+    r"demo|sample|examples?|starter|boilerplate|scaffold|playground|"
+    r"hello[-_]?world|tutorials?|workshops?|poc|proof[-_]?of[-_]?concept|"
+    r"sandbox|kata|exercises?|todo|todoapp|test[-_]?ci"
+    r")([_\-/]|$)"
+)
+# Unambiguous scaffold words that on their own mark a demo/template (no corroboration
+# needed). Weaker tokens above (todo/sandbox/kata/test-ci) still need a 2nd family.
+_STRONG_DEMO_NAME_RE = re.compile(
+    r"(?i)(^|[_\-/])("
+    r"demo|sample|examples?|boilerplate|scaffold|starter|"
+    r"hello[-_]?world|playground|poc|proof[-_]?of[-_]?concept|todomvc"
+    r")([_\-/]|$)"
+)
+# Well-known demo/reference applications (name OR README).
+_KNOWN_DEMO_RE = re.compile(
+    r"(?i)\b(sock[-_ ]?shop|weaveworks|realworld|petclinic|todomvc|"
+    r"guestbook|2048|nodegoat|juice[-_ ]?shop)\b"
+)
+# README phrases that are dead giveaways of a scaffold/demo.
+_TEMPLATE_README_RE = re.compile(
+    r"(?i)("
+    r"bootstrapped with create react app|create-react-app|"
+    r"weaveworks|sock shop|realworld example|"
+    r"this (is a|project is a|repo(sitory)? is a) (demo|sample|example|template|boilerplate|starter)|"
+    r"(sample|example|demo) (app|application|project)|"
+    r"getting started template|starter (kit|template)|scaffold(ing)? for"
+    r")"
+)
+
+
+def analyze_demo_signals(root: Path, repo_name: str, docs: dict) -> dict:
+    """Static signals that a repo is a demo/template/exercise copy rather than
+    original product work. Combined with git 'burst-copy' history (git_stats.py) in
+    score.py to set is_likely_demo. Purely name + README + scaffold-file based."""
+    name_hit = bool(_DEMO_NAME_RE.search(repo_name))
+    strong_name = bool(_STRONG_DEMO_NAME_RE.search(repo_name))
+
+    readme = docs.get("readme")
+    readme_text = read_file_safe(root / readme, max_bytes=4096) if readme else ""
+    known_demo = bool(_KNOWN_DEMO_RE.search(repo_name) or _KNOWN_DEMO_RE.search(readme_text))
+    template_readme = bool(_TEMPLATE_README_RE.search(readme_text))
+    boilerplate_readme = (not readme) or (docs.get("readme_loc", 0) < 12)
+
+    # Default-scaffold fingerprints (Create React App / Vite / Next starters).
+    def ex(*parts): return (root / Path(*parts)).exists()
+    scaffold = (
+        (ex("src", "App.js") or ex("src", "App.tsx")) and ex("src", "logo.svg")
+    ) or (ex("src", "App.vue") and ex("public", "favicon.ico") and not ex("src", "router")) \
+        or ex("pages", "index.js") and ex("pages", "api", "hello.js")
+
+    # Signal families: name-based, content-based (README/scaffold). History is
+    # added later. `authoritative` = a README phrase that on its own is conclusive.
+    return {
+        "name_lexicon_hit": name_hit,
+        "strong_name_hit": strong_name,
+        "known_demo_app": known_demo,
+        "template_readme": template_readme,
+        "scaffold_fingerprint": bool(scaffold),
+        "boilerplate_readme": bool(boilerplate_readme),
+        # Conclusive on its own: a named demo app, a template README, or an
+        # unambiguous scaffold word in the name.
+        "authoritative_demo": template_readme or known_demo or strong_name,
+        # convenience: whether any static family fired
+        "static_name_family": name_hit or known_demo,
+        "static_content_family": template_readme or bool(scaffold),
+    }
+
+
 def analyze_reproducibility(root: Path, source_files: list[tuple[Path, str]]) -> dict:
     has_dockerfile = (root / "Dockerfile").exists() or any((root / f"Dockerfile.{s}").exists() for s in ["dev", "development", "local"])
     has_compose = (root / "docker-compose.yml").exists() or (root / "docker-compose.yaml").exists()
@@ -1148,7 +1251,8 @@ def analyze_class_signals(
         elif ext in (".tsx", ".jsx", ".vue", ".svelte"):
             ui_component_count += 1
         elif ext == ".sql":
-            sql_file_count += 1
+            if not is_sql_dump(abs_path):
+                sql_file_count += 1
         elif ext in (".parquet", ".avro", ".orc", ".feather"):
             data_file_count += 1
         if name == "dockerfile" or name.startswith("dockerfile."):
@@ -1257,6 +1361,7 @@ def main() -> int:
     lint = analyze_lint_config(root)
     test_fw = analyze_test_framework(root)
     docs = analyze_documentation(root)
+    demo_signals = analyze_demo_signals(root, root.name, docs)
     repro = analyze_reproducibility(root, all_files)
     observability = analyze_observability(root, all_files)
     class_signals = analyze_class_signals(root, all_files, languages["loc_by_language"], frameworks)
@@ -1338,6 +1443,10 @@ def main() -> int:
         "contributing_guide": docs["contributing_guide"],
         "has_pr_template": docs["has_pr_template"],
         "has_issue_template": docs["has_issue_template"],
+
+        # Demo / template signals (static; combined with git
+        # burst-copy history in score.py -> is_likely_demo).
+        "demo_signals": demo_signals,
 
         # Reproducibility
         "has_dockerfile": repro["has_dockerfile"],

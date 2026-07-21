@@ -447,6 +447,19 @@ def aggregate_repo_stats(repo: Path) -> dict:
 
     head_sha = run_git(repo, "rev-parse", "HEAD").strip() or None
 
+    # "Burst copy" fingerprint: a few commits, made in a <=2-day window, with no
+    # merges and <=2 authors is the shape of a scaffolded/demo repo that was
+    # created and abandoned rather than developed. Fed into demo detection
+    # (score.py) alongside static name/README signals from repo_stats.py.
+    mc = run_git(repo, "rev-list", "HEAD", "--min-parents=2", "--count").strip()
+    merge_commit_count = int(mc) if mc.isdigit() else 0
+    looks_like_burst_copy = bool(
+        0 < total_commits <= 12
+        and span_days is not None and span_days <= 2
+        and merge_commit_count == 0
+        and len(human_authors) <= 2
+    )
+
     return {
         "head_sha": head_sha,
         "total_commits": total_commits,
@@ -454,6 +467,8 @@ def aggregate_repo_stats(repo: Path) -> dict:
         "last_commit": last or None,
         "span_days": span_days,
         "recency_days": recency_days,
+        "merge_commit_count": merge_commit_count,
+        "looks_like_burst_copy": looks_like_burst_copy,
         "human_authors": len(human_authors),
         "bot_authors": len(bot_authors),
         "bot_commit_count": bot_commit_count,

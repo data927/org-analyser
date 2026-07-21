@@ -62,6 +62,11 @@ GRADE_THRESHOLDS = [
 ]
 
 
+# adjusted_org_score = org_score * (1 - W * demo_fraction). Same weight the
+# reference implementation uses for its combined padding penalty.
+DEMO_PENALTY_WEIGHT = 0.5
+
+
 def grade_for(score: float) -> str:
     for threshold, letter in GRADE_THRESHOLDS:
         if score >= threshold:
@@ -124,6 +129,7 @@ def aggregate(repos: list[dict]) -> dict:
             "classes": [c.get("name") for c in r.get("classes", [])],
             "capacity": r.get("capacity"),
             "mining_rank": r.get("mining_rank"),
+            "is_likely_demo": bool(r.get("is_likely_demo")),
         })
 
     scores = [row["overall_score"] for row in rows]
@@ -143,14 +149,33 @@ def aggregate(repos: list[dict]) -> dict:
 
     # Task-mining ranking: repos ordered by mining_rank (quality x capacity), and the
     # org's total expected good-task yield = sum of mining_rank. Only repos that
-    # carried capacity_inputs through scoring have a mining_rank.
-    mining_rows = [row for row in rows if row.get("mining_rank") is not None]
+    # carried capacity_inputs through scoring have a mining_rank. Demo/template
+    # copies are excluded — their commits are someone else's work, not mineable.
+    mining_rows = [row for row in rows
+                   if row.get("mining_rank") is not None and not row.get("is_likely_demo")]
     mining_ranked = sorted(mining_rows, key=lambda x: x["mining_rank"], reverse=True)
     total_expected_yield = round(sum(row["mining_rank"] for row in mining_rows), 2)
+    demo_excluded_from_mining = sum(
+        1 for row in rows if row.get("mining_rank") is not None and row.get("is_likely_demo"))
+
+    # Demo/template inflation: demos raise the headline number without representing
+    # org-authored product work, so publish an adjusted score that discounts the
+    # demo fraction. Base org_score is left unadjusted.
+    demo_names = sorted(row["repo_name"] for row in rows if row.get("is_likely_demo"))
+    demo_fraction = round(len(demo_names) / len(rows), 4)
+    adjusted = org_score * (1.0 - DEMO_PENALTY_WEIGHT * demo_fraction)
+    adjusted_org_score = round(max(0.0, min(100.0, adjusted)), 4)
 
     return {
         "org_score": round(org_score, 4),
         "org_grade": grade_for(org_score),
+        "adjusted_org_score": adjusted_org_score,
+        "adjusted_org_grade": grade_for(adjusted_org_score),
+        "demo_repo_count": len(demo_names),
+        "demo_fraction": demo_fraction,
+        "demo_repos": demo_names,
+        "demo_excluded_from_mining": demo_excluded_from_mining,
+        "penalty_weight": DEMO_PENALTY_WEIGHT,
         "repo_count": len(rows),
         "monorepo_count": sum(1 for row in rows if row["is_monorepo"]),
         "total_loc": sum(row["total_loc"] for row in rows),
