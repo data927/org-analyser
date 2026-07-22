@@ -1,0 +1,80 @@
+# Manually-triggered custom pipeline: run org-analyser from CI instead of a
+# local machine. Target org/repo and platform tokens are supplied at
+# trigger time via prompted variables and secured repository variables.
+#
+# IMPORTANT: org-analyser reads all credentials from a tokens file / config.yml
+# and deliberately ignores plain env vars, so this pipeline renders a
+# key=value tokens file from repository variables before invoking the CLI.
+#
+# IMPORTANT: Bitbucket Cloud's shared runners hard-cap a step at 120 minutes
+# (max-time below). A full-org run can take hours-to-days (see
+# ORG_PIPELINE_README.md) -- scope TARGET_VALUE to a single repo or small
+# workspace for CI runs, or use a self-hosted runner for large orgs.
+#
+# Required repository variables (Repository settings -> Repository variables,
+# mark each "Secured"):
+#   ORG_ANALYSER_GITHUB_TOKEN       github-data-token (repo-scope PAT)
+#   ORG_ANALYSER_GITLAB_TOKEN       gitlab_token (read_api PAT)
+#   ORG_ANALYSER_BITBUCKET_TOKEN    bitbucket_token
+#   ORG_ANALYSER_BITBUCKET_USERNAME (only for app-password auth)
+#   ORG_ANALYSER_OPENAI_KEY         openai_key -- eval-kit's LLM phase is mandatory
+# Only the variables matching the target platform (+ the OpenAI one) need real values.
+
+image: python:3.11
+
+definitions:
+  steps:
+    - step: &analyse
+        name: Run org-analyser
+        max-time: 120
+        script:
+          - apt-get update -qq && apt-get install -y -qq git nodejs npm curl
+          - curl -sSL https://github.com/boyter/scc/releases/latest/download/scc_Linux_x86_64.tar.gz -o /tmp/scc.tar.gz
+          - tar -xzf /tmp/scc.tar.gz -C /tmp scc && mv /tmp/scc /usr/local/bin/scc
+          - pip install --upgrade pip
+          - pip install -e .
+          - |
+            umask 077
+            {
+              echo "github-data-token=${ORG_ANALYSER_GITHUB_TOKEN}"
+              echo "gitlab_token=${ORG_ANALYSER_GITLAB_TOKEN}"
+              echo "bitbucket_token=${ORG_ANALYSER_BITBUCKET_TOKEN}"
+              echo "bitbucket_username=${ORG_ANALYSER_BITBUCKET_USERNAME}"
+              echo "openai_key=${ORG_ANALYSER_OPENAI_KEY}"
+            } > tokens.env
+          - |
+            case "$TARGET_TYPE" in
+              github-org) FLAG=--github-org ;;
+              github-repo) FLAG=--github-repo ;;
+              gitlab-group) FLAG=--gitlab-group ;;
+              gitlab-project) FLAG=--gitlab-project ;;
+              bitbucket-workspace) FLAG=--bitbucket-workspace ;;
+              bitbucket-repo) FLAG=--bitbucket-repo ;;
+              *) echo "unknown TARGET_TYPE: $TARGET_TYPE" >&2; exit 1 ;;
+            esac
+            HOST_ARGS=()
+            if [ -n "$GITLAB_HOST" ]; then HOST_ARGS=(--gitlab-host "$GITLAB_HOST"); fi
+            org-analyser check "$FLAG" "$TARGET_VALUE" --tokens-file tokens.env "${HOST_ARGS[@]}"
+            org-analyser run "$FLAG" "$TARGET_VALUE" --tokens-file tokens.env --quiet "${HOST_ARGS[@]}" $EXTRA_ARGS
+        artifacts:
+          - outputs/org-analyser-runs/**
+
+pipelines:
+  custom:
+    org-analyser:
+      - variables:
+          - name: TARGET_TYPE
+            default: github-org
+            allowed-values:
+              - github-org
+              - github-repo
+              - gitlab-group
+              - gitlab-project
+              - bitbucket-workspace
+              - bitbucket-repo
+          - name: TARGET_VALUE
+          - name: GITLAB_HOST
+            default: ""
+          - name: EXTRA_ARGS
+            default: "--skip-pr-task-profile --workers 4"
+      - step: *analyse

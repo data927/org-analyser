@@ -1,0 +1,126 @@
+name: org-analyser
+
+# Manually-triggered: run the org-analyser pipeline from CI instead of a
+# local machine. Target org/repo is supplied at trigger time.
+#
+# IMPORTANT: org-analyser reads all credentials from a tokens file / config.yml
+# and deliberately ignores plain env vars, so this workflow renders a
+# key=value tokens file from repo secrets before invoking the CLI.
+#
+# IMPORTANT: GitHub-hosted runners hard-cap a job at 6h. A full-org run can
+# take hours-to-days (see ORG_PIPELINE_README.md) -- scope target_value to a
+# single repo or small workspace for CI runs, or point runs-on at a
+# self-hosted runner for large orgs.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   ORG_ANALYSER_GITHUB_TOKEN      github-data-token (repo-scope PAT)
+#   ORG_ANALYSER_GITLAB_TOKEN      gitlab_token (read_api PAT)
+#   ORG_ANALYSER_BITBUCKET_TOKEN   bitbucket_token
+#   ORG_ANALYSER_BITBUCKET_USERNAME (only for app-password auth)
+#   ORG_ANALYSER_OPENAI_KEY        openai_key -- eval-kit's LLM phase is mandatory
+# Only the secrets matching the target platform (+ the OpenAI one) need real values.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_type:
+        description: "What to analyze"
+        required: true
+        type: choice
+        options:
+          - github-org
+          - github-repo
+          - gitlab-group
+          - gitlab-project
+          - bitbucket-workspace
+          - bitbucket-repo
+      target_value:
+        description: "org/group/workspace name, or owner/repo path (comma-separated for *-repo/-project)"
+        required: true
+        type: string
+      gitlab_host:
+        description: "Self-hosted GitLab host, e.g. gitlab.example.com (blank = gitlab.com)"
+        required: false
+        type: string
+      extra_args:
+        description: "Extra org-analyser flags"
+        required: false
+        type: string
+        default: "--skip-pr-task-profile --workers 4"
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install scc (LOC/language metrics used by the codebase profiler)
+        run: |
+          curl -sSL https://github.com/boyter/scc/releases/latest/download/scc_Linux_x86_64.tar.gz -o /tmp/scc.tar.gz
+          tar -xzf /tmp/scc.tar.gz -C /tmp scc
+          sudo mv /tmp/scc /usr/local/bin/scc
+
+      - name: Install org-analyser
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Write tokens file
+        env:
+          GITHUB_DATA_TOKEN: ${{ secrets.ORG_ANALYSER_GITHUB_TOKEN }}
+          GITLAB_TOKEN: ${{ secrets.ORG_ANALYSER_GITLAB_TOKEN }}
+          BITBUCKET_TOKEN: ${{ secrets.ORG_ANALYSER_BITBUCKET_TOKEN }}
+          BITBUCKET_USERNAME: ${{ secrets.ORG_ANALYSER_BITBUCKET_USERNAME }}
+          OPENAI_KEY: ${{ secrets.ORG_ANALYSER_OPENAI_KEY }}
+        run: |
+          umask 077
+          {
+            echo "github-data-token=$GITHUB_DATA_TOKEN"
+            echo "gitlab_token=$GITLAB_TOKEN"
+            echo "bitbucket_token=$BITBUCKET_TOKEN"
+            echo "bitbucket_username=$BITBUCKET_USERNAME"
+            echo "openai_key=$OPENAI_KEY"
+          } > "$RUNNER_TEMP/tokens.env"
+
+      - name: Run org-analyser
+        env:
+          TARGET_TYPE: ${{ inputs.target_type }}
+          TARGET_VALUE: ${{ inputs.target_value }}
+          GITLAB_HOST: ${{ inputs.gitlab_host }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+        run: |
+          case "$TARGET_TYPE" in
+            github-org) FLAG=--github-org ;;
+            github-repo) FLAG=--github-repo ;;
+            gitlab-group) FLAG=--gitlab-group ;;
+            gitlab-project) FLAG=--gitlab-project ;;
+            bitbucket-workspace) FLAG=--bitbucket-workspace ;;
+            bitbucket-repo) FLAG=--bitbucket-repo ;;
+            *) echo "unknown target_type: $TARGET_TYPE" >&2; exit 1 ;;
+          esac
+
+          HOST_ARGS=()
+          if [ -n "$GITLAB_HOST" ]; then
+            HOST_ARGS=(--gitlab-host "$GITLAB_HOST")
+          fi
+
+          org-analyser check "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" "${HOST_ARGS[@]}"
+          org-analyser run "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" --quiet "${HOST_ARGS[@]}" $EXTRA_ARGS
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: org-analyser-report-${{ github.run_id }}
+          path: outputs/org-analyser-runs/**
+          retention-days: 14
+          if-no-files-found: warn
