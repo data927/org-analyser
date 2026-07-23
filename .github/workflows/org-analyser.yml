@@ -17,8 +17,13 @@ name: org-analyser
 #   ORG_ANALYSER_GITLAB_TOKEN      gitlab_token (read_api PAT)
 #   ORG_ANALYSER_BITBUCKET_TOKEN   bitbucket_token
 #   ORG_ANALYSER_BITBUCKET_USERNAME (only for app-password auth)
-#   ORG_ANALYSER_OPENAI_KEY        openai_key -- eval-kit's LLM phase is mandatory
-# Only the secrets matching the target platform (+ the OpenAI one) need real values.
+#   The LLM phase (eval-kit) is mandatory -- pick a provider via the
+#   llm_provider input and set the matching secret(s):
+#   ORG_ANALYSER_OPENAI_KEY            openai   (also the base for gemini)
+#   ORG_ANALYSER_AZURE_OPENAI_ENDPOINT / _API_KEY / _DEPLOYMENT   azure-openai
+#   ORG_ANALYSER_OPENAI_API_VERSION   optional Azure API version
+#   ORG_ANALYSER_GEMINI_KEY           gemini  (rubrics only; still needs OPENAI_KEY base)
+# Only the secrets matching the target platform (+ one LLM provider) need real values.
 
 on:
   workflow_dispatch:
@@ -38,6 +43,15 @@ on:
         description: "org/group/workspace name, or owner/repo path (comma-separated for *-repo/-project)"
         required: true
         type: string
+      llm_provider:
+        description: "LLM provider for the eval/quality phase (gemini also needs an OpenAI base secret)"
+        required: true
+        type: choice
+        default: openai
+        options:
+          - openai
+          - azure-openai
+          - gemini
       gitlab_host:
         description: "Self-hosted GitLab host, e.g. gitlab.example.com (blank = gitlab.com)"
         required: false
@@ -81,6 +95,12 @@ jobs:
           BITBUCKET_TOKEN: ${{ secrets.ORG_ANALYSER_BITBUCKET_TOKEN }}
           BITBUCKET_USERNAME: ${{ secrets.ORG_ANALYSER_BITBUCKET_USERNAME }}
           OPENAI_KEY: ${{ secrets.ORG_ANALYSER_OPENAI_KEY }}
+          GEMINI_KEY: ${{ secrets.ORG_ANALYSER_GEMINI_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.ORG_ANALYSER_AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.ORG_ANALYSER_AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.ORG_ANALYSER_AZURE_OPENAI_DEPLOYMENT }}
+          OPENAI_API_VERSION: ${{ secrets.ORG_ANALYSER_OPENAI_API_VERSION }}
+          LLM_PROVIDER: ${{ inputs.llm_provider }}
         run: |
           umask 077
           {
@@ -88,7 +108,19 @@ jobs:
             echo "gitlab_token=$GITLAB_TOKEN"
             echo "bitbucket_token=$BITBUCKET_TOKEN"
             echo "bitbucket_username=$BITBUCKET_USERNAME"
-            echo "openai_key=$OPENAI_KEY"
+            echo "gemini_key=$GEMINI_KEY"
+            # Base LLM creds. Write only the chosen provider's -- openai_key
+            # otherwise wins whenever both are present (cli.resolve_openai_key).
+            # gemini drives only the rubrics phase and still needs an OpenAI
+            # base (cli preflight requires OpenAI or Azure), so it uses openai.
+            if [ "$LLM_PROVIDER" = "azure-openai" ]; then
+              echo "AZURE_OPENAI_ENDPOINT=$AZURE_OPENAI_ENDPOINT"
+              echo "AZURE_OPENAI_API_KEY=$AZURE_OPENAI_API_KEY"
+              echo "AZURE_OPENAI_DEPLOYMENT=$AZURE_OPENAI_DEPLOYMENT"
+              echo "OPENAI_API_VERSION=$OPENAI_API_VERSION"
+            else
+              echo "openai_key=$OPENAI_KEY"
+            fi
           } > "$RUNNER_TEMP/tokens.env"
 
       - name: Run org-analyser
@@ -97,6 +129,7 @@ jobs:
           TARGET_VALUE: ${{ inputs.target_value }}
           GITLAB_HOST: ${{ inputs.gitlab_host }}
           EXTRA_ARGS: ${{ inputs.extra_args }}
+          LLM_PROVIDER: ${{ inputs.llm_provider }}
         run: |
           case "$TARGET_TYPE" in
             github-org) FLAG=--github-org ;;
@@ -113,8 +146,13 @@ jobs:
             HOST_ARGS=(--gitlab-host "$GITLAB_HOST")
           fi
 
-          org-analyser check "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" "${HOST_ARGS[@]}"
-          org-analyser run "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" --quiet "${HOST_ARGS[@]}" $EXTRA_ARGS
+          RUBRICS_ARGS=()
+          if [ "$LLM_PROVIDER" = "gemini" ]; then
+            RUBRICS_ARGS=(--pr-rubrics-provider gemini)
+          fi
+
+          org-analyser check "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" "${HOST_ARGS[@]}" "${RUBRICS_ARGS[@]}"
+          org-analyser run "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" --quiet "${HOST_ARGS[@]}" "${RUBRICS_ARGS[@]}" $EXTRA_ARGS
 
       - name: Upload report
         if: always()
