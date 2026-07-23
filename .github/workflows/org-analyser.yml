@@ -60,7 +60,7 @@ on:
         description: "Extra org-analyser flags"
         required: false
         type: string
-        default: "--workers 8"
+        default: "--skip-pr-task-profile --workers 8"
 
 jobs:
   analyse:
