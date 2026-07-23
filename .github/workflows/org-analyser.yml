@@ -40,7 +40,7 @@ on:
           - bitbucket-workspace
           - bitbucket-repo
       target_value:
-        description: "org/group/workspace name, or owner/repo path (comma-separated for *-repo/-project)"
+        description: "Name to scan. For -org/-group/-workspace: just the org name (e.g. plan-ai). For -repo/-project: owner/repo paths, comma-separated (e.g. plan-ai/app, plan-ai/api)"
         required: true
         type: string
       llm_provider:
