@@ -7,6 +7,20 @@ Workflow file: [`org-analyser.yml`](org-analyser.yml).
 
 ---
 
+## 0. Fork it (to run it yourself)
+
+Repo: **<https://github.com/data927/org-analyser>**
+
+1. **Fork** it to your own GitHub profile (top-right **Fork** button).
+2. In your fork: **Actions** tab → **"I understand my workflows, go ahead and
+   enable them"**. Actions are **disabled by default on forks** — this is required.
+3. Add your own secrets (step 1 below). **Secrets never copy over on a fork** —
+   each person adds their own.
+
+Then run it (steps 2–3 below). To scan an org, your token must have access to it.
+
+---
+
 ## 1. Add secrets (one-time)
 
 Go to the repo → **Settings → Secrets and variables → Actions → Secrets tab →
