@@ -151,7 +151,12 @@ jobs:
             RUBRICS_ARGS=(--pr-rubrics-provider gemini)
           fi
 
-          org-analyser check "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" "${HOST_ARGS[@]}" "${RUBRICS_ARGS[@]}"
+          # Preflight is informational only: the run phase skips a repo it
+          # can't clone and keeps going, so one inaccessible repo (e.g. a
+          # private repo the token can list via admin:org but not clone) must
+          # not abort the whole job. `run` still exits non-zero on any failure.
+          org-analyser check "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" "${HOST_ARGS[@]}" "${RUBRICS_ARGS[@]}" \
+            || echo "::warning::preflight had failures; continuing to run (per-repo clone failures are skipped and listed in FAILURES.md)"
           org-analyser run "$FLAG" "$TARGET_VALUE" --tokens-file "$RUNNER_TEMP/tokens.env" --quiet "${HOST_ARGS[@]}" "${RUBRICS_ARGS[@]}" $EXTRA_ARGS
 
       - name: Upload report
