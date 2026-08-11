@@ -37,6 +37,7 @@ from platforms import bitbucket as bitbucket_platform
 from platforms import github as github_platform
 from platforms import gitlab as gitlab_platform
 from platforms.base import ci_headers, request_with_retry
+from platforms.errors import PlatformError
 
 CSV_FIELDS = ["platform", "org", "repo", "merged_count", "error"]
 SUMMARY_FIELDS = ["platform", "org", "repos_total", "merged_total", "token_name", "error"]
@@ -897,9 +898,13 @@ def main() -> int:
     export_p.add_argument("--gitlab-host", default="gitlab.com")
 
     args = parser.parse_args()
-    if args.command == "count":
-        return _run_count(args)
-    return _run_export(args)
+    try:
+        if args.command == "count":
+            return _run_count(args)
+        return _run_export(args)
+    except PlatformError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

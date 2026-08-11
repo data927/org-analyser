@@ -319,18 +319,34 @@ def bitbucket_headers(token: str, username: str = "") -> dict[str, str]:
 def paginate(session: requests.Session, url: str) -> List[dict]:
     """Follow Bitbucket's `next` cursor URL field in the response body
     (not a header -- Bitbucket's own pagination contract, unlike GitHub's
-    `Link` header or GitLab's `X-Next-Page`)."""
+    `Link` header or GitLab's `X-Next-Page`).
+
+    `request_with_retry` returns None for both a 404 (not found) and a
+    network error that exhausted its retries -- those must not be treated
+    alike. A None on the *first* page is a legitimate "not found" (empty
+    result). A None on a later page means pagination broke mid-flight, and
+    silently returning the partial list collected so far would masquerade
+    as a complete, correct result. Callers already catch this per-repo
+    (analysis/pr_task_profile.py's scan loop, cli.py's merged-PR fallback),
+    so raise instead of truncating."""
     items: List[dict] = []
     next_url: Optional[str] = url
+    first_page = True
     while next_url:
         response = request_with_retry(session, "GET", next_url)
         if response is None:
-            break
+            if first_page:
+                break
+            raise PlatformError(
+                f"Bitbucket pagination failed partway through {url} "
+                f"({len(items)} item(s) fetched before the failure)"
+            )
         data = response.json()
         if not isinstance(data, dict):
             break
         items.extend(data.get("values") or [])
         next_url = data.get("next")
+        first_page = False
     return items
 
 

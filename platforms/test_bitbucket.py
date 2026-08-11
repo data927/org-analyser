@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest.mock import MagicMock, patch
 
-from platforms.bitbucket import BitbucketClient
-from platforms.errors import PlatformAuthError
+import requests
+
+from platforms.bitbucket import BitbucketClient, paginate
+from platforms.errors import PlatformAuthError, PlatformError
 
 
 class TestBitbucketClientAuth(unittest.TestCase):
@@ -25,6 +28,44 @@ class TestBitbucketClientAuth(unittest.TestCase):
     def test_uses_basic_auth_when_username_provided(self):
         client = BitbucketClient("owner", "repo", token="secret", username="bob")
         self.assertEqual(client.session.auth, ("bob", "secret"))
+
+
+class TestPaginate(unittest.TestCase):
+    """`request_with_retry` returns None for both "404, nothing here" and
+    "gave up after retries" -- paginate() must not conflate the two."""
+
+    def test_not_found_on_first_page_returns_empty(self):
+        session = requests.Session()
+        with patch("platforms.bitbucket.request_with_retry", return_value=None):
+            self.assertEqual(paginate(session, "https://api.bitbucket.org/2.0/x"), [])
+
+    def test_failure_partway_through_raises_instead_of_truncating(self):
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {
+            "values": [{"id": 1}],
+            "next": "https://api.bitbucket.org/2.0/x?page=2",
+        }
+        session = requests.Session()
+        with patch(
+            "platforms.bitbucket.request_with_retry", side_effect=[page1, None]
+        ):
+            with self.assertRaises(PlatformError):
+                paginate(session, "https://api.bitbucket.org/2.0/x")
+
+    def test_full_pagination_still_works(self):
+        page1 = MagicMock(status_code=200)
+        page1.json.return_value = {
+            "values": [{"id": 1}],
+            "next": "https://api.bitbucket.org/2.0/x?page=2",
+        }
+        page2 = MagicMock(status_code=200)
+        page2.json.return_value = {"values": [{"id": 2}], "next": None}
+        session = requests.Session()
+        with patch(
+            "platforms.bitbucket.request_with_retry", side_effect=[page1, page2]
+        ):
+            items = paginate(session, "https://api.bitbucket.org/2.0/x")
+        self.assertEqual([i["id"] for i in items], [1, 2])
 
 
 if __name__ == "__main__":
