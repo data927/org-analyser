@@ -327,8 +327,7 @@ def paginate(session: requests.Session, url: str) -> List[dict]:
     result). A None on a later page means pagination broke mid-flight, and
     silently returning the partial list collected so far would masquerade
     as a complete, correct result. Callers already catch this per-repo
-    (analysis/pr_task_profile.py's scan loop, cli.py's merged-PR fallback),
-    so raise instead of truncating."""
+    (cli.py's merged-PR fallback), so raise instead of truncating."""
     items: List[dict] = []
     next_url: Optional[str] = url
     first_page = True

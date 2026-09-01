@@ -76,5 +76,5 @@ pipelines:
           - name: GITLAB_HOST
             default: ""
           - name: EXTRA_ARGS
-            default: "--skip-pr-task-profile --workers 4"
+            default: "--workers 4"
       - step: *analyse

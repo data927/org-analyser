@@ -424,8 +424,8 @@ class RubricCandidate:
 
 def _sync_rubrics_item(client: Any, item: BatchItem, max_retries: int = 3) -> BatchItemResult:
     """The sync-fallback path run_batch_or_sync uses below its batch
-    threshold -- one live chat.completions.create call per PR, with the same
-    retry behaviour pr_task_profile's sync path uses."""
+    threshold -- one live chat.completions.create call per PR, with
+    retry/backoff on transient errors."""
     last_err: Optional[str] = None
     for attempt in range(1, max_retries + 1):
         try:

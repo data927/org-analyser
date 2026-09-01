@@ -1,7 +1,7 @@
 [project]
 name = "org-analyser"
 version = "0.1.0"
-description = "Org/repo codebase analysis pipeline: merged-PR counts, PR task-profile, codebase profiler, eval-kit, repo quality score, and repo mirroring, in one installable package."
+description = "Org/repo codebase analysis pipeline: merged-PR counts, codebase profiler, eval-kit, repo quality score, and repo mirroring, in one installable package."
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
@@ -22,7 +22,6 @@ ui = ["streamlit>=1.28"]
 [project.scripts]
 org-analyser = "cli:main"
 merged-prs = "analysis.merged_prs:main"
-pr-task-profile = "analysis.pr_task_profile:main"
 repo-analyzer = "analysis.repo_analyzer:main"
 codebase-profiler = "profiler.cli:main"
 repo-evaluator = "eval.repo_evaluator:main"

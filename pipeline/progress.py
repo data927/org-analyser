@@ -70,7 +70,7 @@ def rich_console_handler(logger: logging.Logger, console: Console) -> Iterator[N
 
 
 class RunProgress:
-    """Spinner rows for the org-lanes (merged-pr-counts, pr-task-profile),
+    """Spinner rows for the org-lanes (merged-pr-counts, aggregate-quality-org),
     plus one bar per repo-phase (clone/redact/codebase-profiler/...) and an
     overall repo bar, all sharing the Console logging is bound to (see
     module docstring for why that sharing matters).
@@ -117,15 +117,6 @@ class RunProgress:
     def __exit__(self, *exc_info: object) -> None:
         self.progress.stop()
 
-    def queue_org_phase(self, name: str, note: str = "queued") -> None:
-        """Pre-create an org-lane row so a phase that deliberately runs late
-        (pr-task-profile runs last) is visible from the start instead of
-        appearing out of nowhere near the end. start=False keeps the elapsed
-        clock at -:--:-- until start_org_phase actually starts the work."""
-        self._org_tasks[name] = self.progress.add_task(
-            name, total=None, start=False, status=note
-        )
-
     def start_org_phase(self, name: str) -> None:
         task_id = self._org_tasks.get(name)
         if task_id is None:
@@ -133,14 +124,6 @@ class RunProgress:
             return
         self.progress.start_task(task_id)
         self.progress.update(task_id, status="running")
-
-    def note_org_phase(self, name: str, status: str) -> None:
-        """Update a running org-lane row's status text without finishing it --
-        e.g. live Batch API stage read from llm.batch's state sidecars."""
-        task_id = self._org_tasks.get(name)
-        if task_id is None:
-            return
-        self.progress.update(task_id, status=status)
 
     def finish_org_phase(self, name: str, ok: bool, status: str | None = None) -> None:
         task_id = self._org_tasks.get(name)

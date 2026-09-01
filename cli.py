@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unified repo pipeline: merged PR counts, PR task-profile report, repo-analyzer
+Unified repo pipeline: merged PR counts, repo-analyzer
 (vendor CSV), codebase profiler, eval-kit (full LLM), and optionally
 repo-quality-score (sealed) for one GitHub org, one GitLab group, one
 Bitbucket workspace, or a folder of downloaded/local repos per run.
@@ -265,7 +265,6 @@ class RunContext:
     profiler_dir: Path
     eval_kit_dir: Path
     quality_dir: Path
-    task_profile_dir: Path
     repo_analyzer_dir: Path
     include_quality_score: bool
     logs_dir: Path
@@ -274,7 +273,6 @@ class RunContext:
     retries: int
     clone_depth: int | None
     skip_f2p: bool
-    skip_pr_task_profile: bool
     pr_rubrics_provider: str
     local_only: bool
     github_host: str
@@ -735,7 +733,7 @@ def run_merged_pr_counts(ctx: RunContext, log: PipelineLogger) -> dict[str, Any]
     # Per-repo progress ("[10/13] latest=... count=0") is verbose and would
     # otherwise print raw to stdout, fighting the rich UI's live rendering
     # and cluttering plain-log runs alike. Captured here and written to the
-    # phase log file instead -- same treatment pr-task-profile's subprocess
+    # phase log file instead -- same treatment eval-kit's subprocess
     # output already gets.
     progress_lines: list[str] = []
     progress_cb = progress_lines.append
@@ -970,7 +968,7 @@ def run_module(
     via `ps` and /proc/<pid>/cmdline.
 
     stream_log_path switches from buffer-then-return to line-by-line
-    write-through: long phases (eval-kit, pr-task-profile) become `tail -f`-able
+    write-through: long phases (eval-kit) become `tail -f`-able
     while they run instead of dumping output only after exit. Lines are
     scrubbed of scrub_values before hitting disk, since this path bypasses the
     scrub that record() applies to buffered detail. Return contract unchanged
@@ -1385,140 +1383,6 @@ def merged_pr_totals(merged_pr_dir: Path) -> dict[str, int]:
         except OSError:
             continue
     return totals
-
-
-def batch_state_summary(batch_state_dir: Path) -> str | None:
-    """One-line rollup of llm.batch's state sidecars for the progress UI.
-
-    The Batch API wait happens inside the pr-task-profile subprocess, which
-    the parent can't see into -- but llm.batch persists every stage/count
-    transition to *.state.json precisely so any process can reconstruct where
-    each batch stands. None when no sidecars exist (sync path or no LLM work).
-    """
-    states: list[dict[str, Any]] = []
-    if batch_state_dir.is_dir():
-        for p in sorted(batch_state_dir.glob("**/*.state.json")):
-            try:
-                states.append(json.loads(p.read_text(encoding="utf-8")))
-            except (OSError, json.JSONDecodeError):
-                continue
-    if not states:
-        return None
-    by_status: dict[str, int] = {}
-    done = total = 0
-    for s in states:
-        by_status[s.get("status", "?")] = by_status.get(s.get("status", "?"), 0) + 1
-        counts = s.get("request_counts") or {}
-        done += counts.get("completed", 0) + counts.get("failed", 0)
-        total += counts.get("total", 0) or s.get("request_count", 0)
-    parts = ", ".join(f"{n} {status}" for status, n in sorted(by_status.items()))
-    if total:
-        return f"batch: {parts} [{done}/{total}]"
-    return f"batch: {parts}"
-
-
-def run_pr_task_profile(
-    ctx: RunContext,
-    log: PipelineLogger,
-    entries: list[RepoEntry],
-) -> dict[str, Any]:
-    log.info("Phase: PR task-profile report (rules + LLM)")
-    ctx.task_profile_dir.mkdir(parents=True, exist_ok=True)
-
-    extra_env: dict[str, str] = {}
-    gh_token = ctx.tokens.get(ctx.github_token_name, "")
-    gl_token = ctx.tokens.get(GITLAB_TOKEN_NAME, "")
-    bb_token = ctx.tokens.get(BITBUCKET_TOKEN_NAME, "")
-    bb_user = ctx.tokens.get(BITBUCKET_USERNAME_NAME, "")
-    if gh_token:
-        extra_env["GITHUB_TOKEN"] = gh_token
-    if gl_token:
-        extra_env["GITLAB_TOKEN"] = gl_token
-    if bb_token:
-        extra_env["BITBUCKET_TOKEN"] = bb_token
-    if bb_user:
-        extra_env["BITBUCKET_USERNAME"] = bb_user
-
-    args = [
-        "--output-dir",
-        str(ctx.task_profile_dir),
-        "--max-workers",
-        str(min(ctx.workers, 6)),
-        "--gitlab-host",
-        ctx.gitlab_host,
-    ]
-
-    if ctx.platform == "github":
-        args.extend(["--org", ctx.target])
-    elif ctx.platform == "github-repo":
-        for repo in ctx.github_repos:
-            args.extend(["--repo", repo])
-    elif ctx.platform in ("bitbucket", "bitbucket-repo"):
-        # pr_task_profile doesn't expand workspaces itself, so pass each
-        # already-discovered repo.
-        for entry in entries:
-            args.extend(["--bitbucket-repo", entry.full_name])
-    elif ctx.platform == "gitlab":
-        args.extend(["--gitlab-group", ctx.target])
-    elif ctx.platform == "gitlab-project":
-        for project in ctx.gitlab_projects:
-            args.extend(["--gitlab-project", project])
-    else:
-        github_repos: list[str] = []
-        gitlab_projects: list[str] = []
-        for entry in entries:
-            ref = resolve_remote_ref(entry, ctx)
-            if not ref:
-                continue
-            platform, full_name = ref
-            if platform == "github":
-                github_repos.append(full_name)
-            else:
-                gitlab_projects.append(full_name)
-        if not github_repos and not gitlab_projects:
-            log.info("PR task-profile skipped (local mode, no remote repo mapping)")
-            return {"skipped": True, "reason": "local mode without remote mapping"}
-        if github_repos and not gh_token:
-            return {"ok": False, "error": "github token required for PR task-profile"}
-        if gitlab_projects and not gl_token:
-            return {"ok": False, "error": "gitlab token required for PR task-profile"}
-        for repo in sorted(set(github_repos)):
-            args.extend(["--repo", repo])
-        for project in sorted(set(gitlab_projects)):
-            args.extend(["--gitlab-project", project])
-
-    code, out, err = run_module(
-        "analysis.pr_task_profile",
-        args,
-        timeout=86400,
-        cwd=CODING,
-        extra_env=extra_env or None,
-        # Runs last and can take hours on active orgs: stream output live so
-        # progress is `tail -f`-able. pr-task-profile.log still gets the final
-        # (truncated) copy below, preserving the existing behaviour.
-        stream_log_path=ctx.logs_dir / "pr-task-profile.stream.log",
-        scrub_values=tuple(t for t in (gh_token, gl_token, bb_token) if t),
-    )
-    if code != 0 and err == "timeout":
-        log.phase_log(ctx.logs_dir / "pr-task-profile.log", "timeout after 24h")
-        return {"ok": False, "error": "timeout"}
-
-    detail = (out or "") + (err or "")
-    log.phase_log(ctx.logs_dir / "pr-task-profile.log", detail[-50000:])
-
-    if code != 0:
-        log.error(f"PR task-profile failed: {detail[-500:]}")
-        return {"ok": False, "error": detail[-1000:]}
-
-    summary_csvs = sorted(ctx.task_profile_dir.glob("scan_*/org_summary.csv"))
-    summary_jsons = sorted(ctx.task_profile_dir.glob("scan_*/org_summary.json"))
-    result: dict[str, Any] = {"ok": True}
-    if summary_csvs:
-        result["org_summary_csv"] = str(summary_csvs[-1])
-    if summary_jsons:
-        result["org_summary_json"] = str(summary_jsons[-1])
-    log.info(f"PR task-profile complete -> {result.get('org_summary_csv', ctx.task_profile_dir)}")
-    return result
 
 
 # Order matters: each phase's output depends on the working tree state left
@@ -1941,7 +1805,6 @@ def build_run_context(
         profiler_dir=run_dir / "codebase-profiler",
         eval_kit_dir=run_dir / "eval-kit",
         quality_dir=run_dir / "repo-quality-score",
-        task_profile_dir=run_dir / "pr-task-profile",
         repo_analyzer_dir=run_dir / "repo-analyzer",
         include_quality_score=include_quality_score,
         logs_dir=run_dir / "logs",
@@ -1950,7 +1813,6 @@ def build_run_context(
         retries=args.retries,
         clone_depth=args.clone_depth if args.clone_depth > 0 else None,
         skip_f2p=args.skip_f2p,
-        skip_pr_task_profile=args.skip_pr_task_profile,
         pr_rubrics_provider=args.pr_rubrics_provider,
         local_only=local_only,
         github_host=args.github_host,
@@ -2088,13 +1950,6 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
         "output feeds a benchmark harness that needs execution-verified tasks.",
     )
     parser.add_argument(
-        "--skip-pr-task-profile",
-        action="store_true",
-        default=bool(CONFIG.get("skip_pr_task_profile", False)),
-        help="Skip the org-level PR task-profile phase (the flakiest/longest "
-        "phase: network/GraphQL with a 24h timeout). Other phases are unaffected.",
-    )
-    parser.add_argument(
         "--pr-rubrics-provider",
         choices=("openai", "gemini"),
         default=CONFIG.get("pr_rubrics_provider", "openai"),
@@ -2160,7 +2015,7 @@ def build_top_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="org-analyser",
         description=(
-            "Run (or resume, inspect, retry) the merged PR counts / PR task-profile / "
+            "Run (or resume, inspect, retry) the merged PR counts / "
             "codebase profiler / eval-kit / repo-quality-score pipeline for one org/group. "
             "Defaults for `run`/`check` can be set in config.yml; CLI flags override it."
         ),
@@ -2231,8 +2086,8 @@ def print_transparency_banner(local_only: bool) -> None:
 def run_org_phase(
     ctx: RunContext, log: PipelineLogger, phase: str, fn: Callable[[], dict[str, Any]]
 ) -> dict[str, Any]:
-    """Run one org-level phase (merged-pr-counts, pr-task-profile) with the
-    same DB write-through and resume-skip as per-repo phases -- and,
+    """Run one org-level phase (merged-pr-counts, aggregate-quality-org) with
+    the same DB write-through and resume-skip as per-repo phases -- and,
     critically, isolated: an unhandled exception here used to abort the
     entire pipeline before a single repo was processed. It now always
     degrades to a recorded failure while discovery and the repo pool
@@ -2347,14 +2202,10 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
         ctx.manifest["repo_count"] = len(entries)
 
         # merged-pr-counts runs concurrently with the repo pool (it only reads
-        # the hosting API, not the clones). pr-task-profile is deliberately held
-        # back to run LAST, once every other folder is written: it is the
-        # flakiest and longest phase (network/GraphQL, 24h timeout), so running
-        # it on its own at the end means a failure there can never block or
-        # taint the rest of the run's output.
+        # the hosting API, not the clones).
         log.info(
             f"Per-repo phases: processing {len(entries)} repos with {ctx.workers} workers "
-            "(alongside merged-pr-counts; pr-task-profile runs last)"
+            "(alongside merged-pr-counts)"
         )
         repo_results: list[dict[str, Any]] = []
         use_rich = should_use_rich(args.quiet)
@@ -2398,11 +2249,6 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
                         progress_ui.finish_org_phase("merged-pr-counts", ok)
 
                     fut.add_done_callback(_flip_merged_pr_counts)
-            # pr-task-profile is NOT submitted here -- it runs last, after the
-            # repo pool and merged-pr-counts finish (see below). Row appears
-            # immediately anyway so the phase isn't invisible until then.
-            if progress_ui and not ctx.skip_pr_task_profile:
-                progress_ui.queue_org_phase("pr-task-profile", "queued (runs last)")
             on_phase = progress_ui.update_phase if progress_ui else None
             repo_futures = {
                 repo_pool.submit(process_repo, e, ctx, log, on_phase): e for e in entries
@@ -2485,48 +2331,6 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
                 if progress_ui:
                     ok = not (isinstance(result, dict) and result.get("ok") is False)
                     progress_ui.finish_org_phase(name, ok)
-
-            # pr-task-profile runs LAST -- every repo phase and merged-pr-counts
-            # is done and written by now, so its network/GraphQL flakiness can
-            # only affect its own folder, never the rest of the run.
-            if ctx.skip_pr_task_profile:
-                log.info("pr-task-profile skipped (--skip-pr-task-profile)")
-                ctx.manifest["phases"]["pr-task-profile"] = {
-                    "skipped": True,
-                    "reason": "--skip-pr-task-profile",
-                }
-            else:
-                if progress_ui:
-                    progress_ui.start_org_phase("pr-task-profile")
-                stop_watch = threading.Event()
-                watch_thread: threading.Thread | None = None
-                if progress_ui:
-                    # Surface the subprocess's Batch API stages on this row
-                    # ("batch: 1 in_progress [120/500]") by polling the state
-                    # sidecars llm.batch writes on every transition -- without
-                    # this, a multi-hour batch wait is a bare spinner.
-                    def _watch_batches() -> None:
-                        while not stop_watch.wait(5.0):
-                            summary = batch_state_summary(ctx.task_profile_dir / "batch_state")
-                            if summary:
-                                progress_ui.note_org_phase(
-                                    "pr-task-profile", f"running ({summary})"
-                                )
-
-                    watch_thread = threading.Thread(target=_watch_batches, daemon=True)
-                    watch_thread.start()
-                try:
-                    task_result = run_org_phase(
-                        ctx, log, "pr-task-profile", lambda: run_pr_task_profile(ctx, log, entries)
-                    )
-                finally:
-                    stop_watch.set()
-                    if watch_thread is not None:
-                        watch_thread.join(timeout=2)
-                ctx.manifest["phases"]["pr-task-profile"] = task_result
-                if progress_ui:
-                    ok = not (isinstance(task_result, dict) and task_result.get("ok") is False)
-                    progress_ui.finish_org_phase("pr-task-profile", ok)
 
         if ctx.include_quality_score:
             if ctx.state.org_phase_status(ctx.run_id, "aggregate-quality-org") in DONE_STATUSES:
@@ -2817,7 +2621,7 @@ def retry_command(
         print(f"Reset {n} failed/interrupted/running phase row(s) to pending.")
         quality_touched = True
     elif phase and not repo:
-        if phase in ("merged-pr-counts", "pr-task-profile", "aggregate-quality-org"):
+        if phase in ("merged-pr-counts", "aggregate-quality-org"):
             state.reset_phase(run_id, phase, force=force)
             print(f"Reset org phase {phase!r}.")
         else:
@@ -2970,13 +2774,13 @@ def run_sanity_checks(
         if ctx.pr_rubrics_provider == "gemini":
             return "skipped (gemini live-check not implemented)"
         from llm.llm_safety import safe_openai  # noqa: WPS433
-        from analysis.pr_task_profile import DEFAULT_MODEL  # noqa: WPS433
+        from eval.quality_evaluator import DEFAULT_OPENAI_MODEL as DEFAULT_MODEL  # noqa: WPS433
 
         # A real completion call, not models.list() -- that only proves the
         # key is authenticated, not that the account has completions quota.
         # insufficient_quota comes back as a 429 here, same as the real
-        # per-PR calls pr-task-profile makes, so it's caught before any
-        # phase runs instead of 11+ calls deep into a real run.
+        # per-PR calls eval-kit's PR-rubrics scoring makes, so it's caught
+        # before any phase runs instead of 11+ calls deep into a real run.
         safe_openai().chat.completions.create(
             model=DEFAULT_MODEL,
             temperature=0,

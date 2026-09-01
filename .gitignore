@@ -16,6 +16,7 @@ logs/
 .claude/
 .vscode/
 .pytest_cache/
+measure-work/
 
 # Your global ~/.gitignore_global blanket-ignores .github/ (meant for
 # unrelated AI-tool dirs). Un-ignore it here so GitHub Actions workflows

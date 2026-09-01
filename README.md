@@ -1,10 +1,10 @@
 # org-analyser
 
-Org/repo codebase analysis pipeline: merged-PR counts, PR task-profile,
+Org/repo codebase analysis pipeline: merged-PR counts,
 codebase profiler, eval-kit, and sealed repo quality score — one command,
 one or many repos, across GitHub, GitLab, Bitbucket, or local checkouts.
 
-Subpackages: `analysis/` (PR counts, task-profile, vendor-CSV analyzer),
+Subpackages: `analysis/` (PR counts, vendor-CSV analyzer),
 `profiler/` (codebase intake sheet), `eval/` (LLM repo evaluation),
 `quality/` (sealed quality score), `mirror/` (org/group replication).
 
@@ -43,7 +43,7 @@ Set `gitlab_host` in `config.yml` (or pass `--gitlab-host`) when your repos
 live on a **self-hosted GitLab** instance instead of gitlab.com. Use the
 hostname only (`gitlab.example.com`) or a full base URL
 (`https://gitlab.example.com`). Every GitLab phase — repo discovery, merged-PR
-counts, cloning, PR task-profile, and eval — uses this host.
+counts, cloning, and eval — uses this host.
 
 ```yaml
 gitlab_group: my-group          # or gitlab_project: ["my-group/repo-a"]
@@ -74,7 +74,6 @@ the same `--gitlab-host` you use for the real run (or set `gitlab_host` in
 org-analyser --github-org <ORG_NAME> --workers 10        # whole org
 org-analyser --github-repo <OWNER>/<REPO>                 # single repo
 org-analyser --local-repos-dir ./repos --workers 4         # local checkouts
-org-analyser --github-org <ORG_NAME> --skip-pr-task-profile # skip only the PR task-profile phase
 
 # Self-hosted GitLab (set gitlab_host in config.yml to avoid repeating the flag)
 org-analyser --gitlab-group <GROUP> --gitlab-host gitlab.example.com
@@ -126,11 +125,10 @@ otherwise (the run is still resumable — rerun the same command, or
 
 - **`SSL: CERTIFICATE_VERIFY_FAILED`** — fixed via `certifi`; rerun after `pip install -e .`. Self-hosted GitLab with a private CA may still need your system trust store configured.
 - **Auth / 404** — check the token's access and the `owner/repo` spelling; `org-analyser check` catches this before a real run.
-- **GitLab 401 against `gitlab.com`** — your token is for a self-hosted instance but `gitlab_host` is still the default. Set `gitlab_host` in `config.yml` or pass `--gitlab-host gitlab.example.com`. The PR task-profile log line `host=gitlab.com` is the tell.
+- **GitLab 401 against `gitlab.com`** — your token is for a self-hosted instance but `gitlab_host` is still the default. Set `gitlab_host` in `config.yml` or pass `--gitlab-host gitlab.example.com`. A merged-PR-counts log line `host=gitlab.com` is the tell.
 - **Config not picked up** — run from the repo root, or set `ORG_ANALYSER_CONFIG=/path/to/config.yml`.
 
 ## More docs
 
-`ORG_PIPELINE_README.md` (full pipeline), `PR_TASK_PROFILE_README.md` (PR
-classification), `SECURITY_AND_COMPLIANCE.md` (credential handling and
-redaction model).
+`ORG_PIPELINE_README.md` (full pipeline), `SECURITY_AND_COMPLIANCE.md`
+(credential handling and redaction model).

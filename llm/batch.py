@@ -1,7 +1,7 @@
 """OpenAI Batch API broker: shared by every phase that scores many PRs with
-the same prompt shape (pr_task_profile, eval-kit's PR-rubrics, the
-cybersecurity PR scanner, task taxonomy) so a 7,000-PR org run is one batch
-instead of 7,000 live chat.completions.create calls.
+the same prompt shape (eval-kit's PR-rubrics, the cybersecurity PR scanner,
+task taxonomy) so a 7,000-PR org run is one batch instead of 7,000 live
+chat.completions.create calls.
 
 Batch processing requires the whole request set up front -- there is no
 per-item streaming API, unlike chat.completions.create. Every call site is
@@ -11,7 +11,7 @@ fully-materialized list[BatchItem], never a generator, precisely because
 half-collected input can't be submitted.
 
 Resumability here is file-based, not tied to the main pipeline's state.db --
-pr_task_profile.py and eval-kit run as their own subprocess, separate from
+eval-kit runs as its own subprocess, separate from
 the process that owns the pipeline's SQLite state. The moment a batch is
 accepted by OpenAI it is real, billable, in-flight work; the state.json
 sidecar records the batch_id first, so a crash after submit resumes by
