@@ -266,13 +266,39 @@ def paginate(session: requests.Session, url: str, params: Optional[dict] = None)
     return results
 
 
-def list_repos(token: str, org: str, host: str = "github.com") -> list[str]:
-    """List non-archived repo full_names for a GitHub org or user."""
+def list_repo_items(token: str, org: str, host: str = "github.com") -> list[dict]:
+    """List non-archived repo payloads for a GitHub org or user.
+
+    ``GET /users/{login}/repos`` never returns the authenticated user's private
+    repos; GitHub requires ``GET /user/repos`` for those. When ``org`` matches
+    the token owner, use that endpoint so private personal repos are included.
+    """
     session = requests.Session()
     session.headers.update(github_headers(token))
     api = github_api(host)
+    me = None
+    response = request_with_retry(session, "GET", f"{api}/user")
+    if response is not None and response.status_code == 200:
+        try:
+            me = (response.json() or {}).get("login")
+        except ValueError:
+            me = None
+    if me and me.lower() == org.lower():
+        items = paginate(
+            session,
+            f"{api}/user/repos",
+            params={"per_page": 100, "affiliation": "owner", "visibility": "all"},
+        )
+        owned = [r for r in items if not r.get("archived")]
+        if owned:
+            return owned
     for kind in (f"orgs/{org}/repos", f"users/{org}/repos"):
         items = paginate(session, f"{api}/{kind}", params={"per_page": 100, "type": "all"})
         if items:
-            return [r["full_name"] for r in items if not r.get("archived")]
+            return [r for r in items if not r.get("archived")]
     raise PlatformError(f"no repositories found for {org!r} on {host}")
+
+
+def list_repos(token: str, org: str, host: str = "github.com") -> list[str]:
+    """List non-archived repo full_names for a GitHub org or user."""
+    return [r["full_name"] for r in list_repo_items(token, org, host)]

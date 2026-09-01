@@ -1098,8 +1098,21 @@ class GitHubProvider:
 
     def list_group_projects(self, org):
         repos = self.paginate(f"/orgs/{org}/repos", params={"type": "all"})
-        if not repos:  # maybe it's a user account, not an org
-            repos = self.paginate(f"/users/{org}/repos")
+        if not repos:  # personal account: /users/{login}/repos hides private repos
+            me = self.get("/user")
+            login = ""
+            if me is not None:
+                try:
+                    login = (me.json() or {}).get("login") or ""
+                except ValueError:
+                    login = ""
+            if login.lower() == str(org).lower():
+                repos = self.paginate(
+                    "/user/repos",
+                    params={"affiliation": "owner", "visibility": "all"},
+                )
+            if not repos:
+                repos = self.paginate(f"/users/{org}/repos", params={"type": "all"})
         return [r["full_name"] for r in repos if not r.get("archived")]
 
     def project_info(self, project_id):

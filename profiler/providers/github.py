@@ -1,8 +1,8 @@
 """GitHub provider — REST for listing/repo metadata, GraphQL for PR review stats.
 
-Repo listing delegates its pagination to `platforms.github.paginate`, which follows the
-`Link` response header (`rel="next"`) per GitHub's actual pagination contract, instead of
-looping page numbers until an empty page comes back.
+Repo listing uses `platforms.github.list_repo_items`, which follows the
+`Link` response header (`rel="next"`) and includes private personal repos
+via `GET /user/repos` when the token owner matches the requested login.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import logging
 
 import requests
 
-from platforms.github import github_api, paginate
+from platforms.github import github_api, list_repo_items
 
 from .base import GitProvider, ProviderError, RemoteRepo
 
@@ -50,14 +50,11 @@ class GitHubProvider(GitProvider):
         return h
 
     def list_repos(self, org: str) -> list[RemoteRepo]:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "codebase-profiler", **self._headers()})
-        repos: list[RemoteRepo] = []
-        for kind in (f"orgs/{org}/repos", f"users/{org}/repos"):
-            items = paginate(session, f"{self.api}/{kind}", params={"per_page": 100, "type": "all"})
-            if items:
-                repos = [self._to_repo(r) for r in items if not r.get("archived")]
-                break  # this kind (org vs user) resolved; don't also try the other
+        try:
+            items = list_repo_items(self.token or "", org, self.web_host)
+        except Exception as exc:
+            raise ProviderError(str(exc)) from exc
+        repos = [self._to_repo(r) for r in items]
         if not repos:
             raise ProviderError(f"no repositories found for '{org}' on {self.web_host}")
         return repos
