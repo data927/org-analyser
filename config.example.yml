@@ -40,6 +40,7 @@ workers: 10                  # parallel repos
 retries: 3                   # retries per repo per phase
 clone_depth: 0                # 0 = full clone
 skip_quality_score: false    # skip the sealed repo-quality-score phase
+skip_pr_task_profile: false  # skip org-level PR task-profile (rules + LLM on every merged PR; runs last)
 skip_f2p: true                # eval-kit's test verification: slowest step (installs deps + runs tests 3x per accepted PR); set false only when output feeds a benchmark harness
 
 # --- advanced (rarely needed) ---

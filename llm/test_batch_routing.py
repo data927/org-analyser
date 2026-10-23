@@ -125,6 +125,70 @@ def test_default_threshold_uses_batch_for_large_workloads():
     assert len(results) == batch.DEFAULT_BATCH_THRESHOLD
 
 
+def test_sync_fallback_false_reraises_batch_failure():
+    """Hardened callers (pr-task-profile large N) must not stampede sync."""
+    original_run_batch = batch.run_batch
+    sync_seen: list[str] = []
+
+    def boom(*args, **kwargs):
+        raise TimeoutError("batch poll timed out")
+
+    try:
+        batch.run_batch = boom
+        try:
+            batch.run_batch_or_sync(
+                object(),
+                _items(5),
+                Path("unused"),
+                "no-fallback",
+                sync_fn=lambda item: (
+                    sync_seen.append(item.custom_id)
+                    or batch.BatchItemResult(item.custom_id, True, "{}", None, item.metadata)
+                ),
+                mode="auto",
+                threshold=3,
+                sync_fallback=False,
+                max_workers=1,
+            )
+            raise AssertionError("expected TimeoutError")
+        except TimeoutError:
+            pass
+    finally:
+        batch.run_batch = original_run_batch
+
+    assert sync_seen == []
+
+
+def test_auto_mode_still_falls_back_when_sync_fallback_true():
+    original_run_batch = batch.run_batch
+    sync_seen: list[str] = []
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("batch unavailable")
+
+    try:
+        batch.run_batch = boom
+        results = batch.run_batch_or_sync(
+            object(),
+            _items(3),
+            Path("unused"),
+            "fallback-ok",
+            sync_fn=lambda item: (
+                sync_seen.append(item.custom_id)
+                or batch.BatchItemResult(item.custom_id, True, "{}", None, item.metadata)
+            ),
+            mode="auto",
+            threshold=2,
+            sync_fallback=True,
+            max_workers=1,
+        )
+    finally:
+        batch.run_batch = original_run_batch
+
+    assert sorted(sync_seen) == ["0", "1", "2"]
+    assert len(results) == 3
+
+
 def test_pipeline_eval_kit_keeps_automatic_llm_routing():
     captured: dict[str, object] = {}
     original_run_module = cli.run_module

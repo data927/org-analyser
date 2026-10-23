@@ -7,8 +7,6 @@ __pycache__/
 .venv/
 venv/
 env311/
-outputs/org-pipeline-runs/
-outputs/org-analyser-runs/
 *.egg-info/
 logs/
 *.log
@@ -16,7 +14,23 @@ logs/
 .claude/
 .vscode/
 .pytest_cache/
+node_modules/
+package-lock.json
 measure-work/
+
+# All pipeline / client run artefacts — never commit (org names, PR text, scores)
+outputs/*
+!outputs/.gitkeep
+
+# Common local dump dirs that can hold client deliverables
+Desktop-exports/
+client-outputs/
+*-org-analyser*/
+*-repo-quality-score*/
+*-measure-ext*/
+*-measure-out*/
+*.sealed.json
+FAILURES.md
 
 # Your global ~/.gitignore_global blanket-ignores .github/ (meant for
 # unrelated AI-tool dirs). Un-ignore it here so GitHub Actions workflows

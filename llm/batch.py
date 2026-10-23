@@ -299,6 +299,7 @@ def run_batch_or_sync(
     mode: str = "auto",
     threshold: int = DEFAULT_BATCH_THRESHOLD,
     max_workers: int = DEFAULT_MAX_WORKERS,
+    sync_fallback: bool = True,
     **batch_kwargs: Any,
 ) -> list[BatchItemResult]:
     """Single entry point call sites should use instead of a raw per-item
@@ -309,7 +310,9 @@ def run_batch_or_sync(
     behaviour -- since a handful of requests shouldn't wait on a queue that
     can take up to 24h. mode="batch"/"sync" force one path; "auto" also
     degrades to sync if the Batch API call itself fails (e.g. an Azure
-    deployment without batch support configured).
+    deployment without batch support configured), unless `sync_fallback`
+    is False (callers that must not stampede thousands of live requests
+    after a Batch timeout should pass False).
     """
     if not items:
         return []
@@ -319,7 +322,7 @@ def run_batch_or_sync(
         try:
             return run_batch(client, items, work_dir, tag, **batch_kwargs)
         except Exception as exc:
-            if mode == "batch":
+            if mode == "batch" or not sync_fallback:
                 raise
             # auto mode only: fall through to the sync path below.
             logger.warning(
