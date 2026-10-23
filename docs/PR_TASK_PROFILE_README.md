@@ -17,8 +17,8 @@ pr-task-profile --org your-org                       # console script
 python3 -m analysis.pr_task_profile --org your-org   # module form
 ```
 
-The full pipeline (`org-analyser run`) still runs this phase **last** unless you
-pass `--skip-pr-task-profile`.
+Mode 1 (`org-analyser run`) does **not** run this phase — use Mode 2 above.
+Only `--no-skip-pr-task-profile` on a full run would include it (still last).
 
 ---
 

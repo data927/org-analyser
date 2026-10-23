@@ -177,6 +177,18 @@ def test_process_prs_small_n_uses_sync():
     assert rows[0]["llm_category"] == "simple_fix"
 
 
+def test_mode1_skips_pr_task_profile_by_default():
+    """Full pipeline (Mode 1) must not run task-profile unless opted in."""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    cli.add_run_arguments(parser)
+    ns = parser.parse_args([])
+    assert ns.skip_pr_task_profile is True
+    ns2 = parser.parse_args(["--no-skip-pr-task-profile"])
+    assert ns2.skip_pr_task_profile is False
+
+
 def test_cli_parent_timeout_is_five_hours_not_twenty_four():
     """run_pr_task_profile must pass the hardened 5h parent ceiling."""
     captured: dict[str, object] = {}

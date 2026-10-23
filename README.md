@@ -70,26 +70,25 @@ the same `--gitlab-host` you use for the real run (or set `gitlab_host` in
 
 ## Run — two modes
 
-### Mode 1: full pipeline (`org-analyser run`)
+### Mode 1: full pipeline **without** PR task-profile (`org-analyser run`)
 
-Clones repos and runs every phase (merged-PR counts, profiler, eval-kit,
-quality score, and **PR task-profile last**):
+Clones repos and runs merged-PR counts, profiler, eval-kit, and quality score.
+Does **not** run PR task-profile (that is Mode 2).
 
 ```bash
 org-analyser --github-org <ORG_NAME> --workers 10        # whole org
 org-analyser --github-repo <OWNER>/<REPO>                 # single repo
 org-analyser --local-repos-dir ./repos --workers 4         # local checkouts
-org-analyser --github-org <ORG_NAME> --skip-pr-task-profile # skip only the PR task-profile phase
 
 # Self-hosted GitLab (set gitlab_host in config.yml to avoid repeating the flag)
 org-analyser --gitlab-group <GROUP> --gitlab-host gitlab.example.com
 org-analyser --gitlab-project <GROUP>/<PROJECT> --gitlab-host gitlab.example.com
 ```
 
-### Mode 2: PR task-profile only
+### Mode 2: PR task-profile **only**
 
 Rules + LLM classification of every merged PR — **no clones**, no profiler /
-eval-kit. Use when you only need the task-profile report:
+eval-kit / quality score:
 
 ```bash
 # either entry point (identical behaviour)
@@ -102,9 +101,9 @@ pr-task-profile --repo owner/a,owner/b --llm-mode auto
 ```
 
 Same platform flags work for `--gitlab-group`/`--gitlab-project` and
-`--bitbucket-workspace`/`--bitbucket-repo` on the full pipeline. Any flag can
-be set as a default in `config.yml` — including `gitlab_host` for self-hosted
-instances. `org-analyser run --help` and `pr-task-profile --help` list the rest.
+`--bitbucket-workspace`/`--bitbucket-repo` on Mode 1. Any flag can be set as a
+default in `config.yml` — including `gitlab_host` for self-hosted instances.
+`org-analyser run --help` and `pr-task-profile --help` list the rest.
 
 **Outputs are local-only.** Everything under `outputs/` is gitignored so client
 org names, PR text, and scores never get committed.

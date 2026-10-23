@@ -192,12 +192,12 @@ const doc = new Document({
         twoColTable([
           ["Mode", "What it does"],
           [
-            "1. Full pipeline",
-            "org-analyser run — clones every repo and runs all phases (merged-PR counts, profiler, eval-kit, quality score, and PR task-profile last).",
+            "1. Full pipeline (no task-profile)",
+            "org-analyser run — clones every repo and runs merged-PR counts, profiler, eval-kit, and quality score. Does NOT run PR task-profile.",
           ],
           [
             "2. PR task-profile only",
-            "org-analyser pr-task-profile  OR  pr-task-profile — classifies every merged pull request with rules + AI. No clones, no profiler, no eval-kit. Faster when you only need the task-profile report.",
+            "org-analyser pr-task-profile  OR  pr-task-profile — classifies every merged pull request with rules + AI. No clones, no profiler, no eval-kit, no quality score.",
           ],
         ]),
         tip(
@@ -298,9 +298,9 @@ const doc = new Document({
           "config.yml is deliberately excluded from git, so your secret keys are never accidentally uploaded anywhere. The entire outputs/ folder is also gitignored so client run results never land in the repo."
         ),
 
-        h1("Step 5a: Mode 1 — full pipeline"),
+        h1("Step 5a: Mode 1 — full pipeline (everything except PR task-profile)"),
         p(
-          "Pick the example below that matches what you want to analyze, replace the <placeholders>, and run it. Each run can take anywhere from minutes to several hours depending on how many repositories there are. PR task-profile runs last automatically."
+          "Pick the example below that matches what you want to analyze, replace the <placeholders>, and run it. Each run can take anywhere from minutes to several hours depending on how many repositories there are. This mode does not run PR task-profile — use Mode 2 for that."
         ),
         p("Analyze an entire GitHub organization", { bold: true }),
         cmd("org-analyser --github-org <ORG_NAME> --workers 10"),
@@ -316,7 +316,7 @@ const doc = new Document({
         p("Analyze a folder of repos already on your computer", { bold: true }),
         cmd("org-analyser --local-repos-dir ./repos --workers 4"),
         tip(
-          "To skip only the PR task-profile phase (still run everything else), add --skip-pr-task-profile. To skip sealed quality scores, add --skip-quality-score."
+          "Mode 1 already skips PR task-profile. To skip sealed quality scores as well, add --skip-quality-score. Only pass --no-skip-pr-task-profile if you deliberately want Mode 1 and Mode 2 glued into one run."
         ),
         note(
           "If your terminal says “org-analyser: command not found”, make sure .venv is active (Step 3), or use “python cli.py” with the same flags instead."

@@ -2090,11 +2090,12 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--skip-pr-task-profile",
-        action="store_true",
-        default=bool(CONFIG.get("skip_pr_task_profile", False)),
-        help="Skip the org-level PR task-profile phase (rules + LLM on every "
-        "merged PR; runs last with per-repo/org deadlines). Other phases are "
-        "unaffected.",
+        action=argparse.BooleanOptionalAction,
+        default=bool(CONFIG.get("skip_pr_task_profile", True)),
+        help="Mode 1 (full pipeline) skips PR task-profile by default — use "
+        "`org-analyser pr-task-profile` / `pr-task-profile` for that alone. "
+        "Pass --no-skip-pr-task-profile only if you deliberately want both "
+        "in one run (task-profile still runs last).",
     )
     parser.add_argument(
         "--pr-rubrics-provider",
@@ -2184,9 +2185,9 @@ def build_top_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="org-analyser",
         description=(
-            "Two modes: (1) `run` — full pipeline (merged PR counts, profiler, "
-            "eval-kit, quality score, and PR task-profile last); "
-            "(2) `pr-task-profile` — only the rules+LLM PR classifier, no clones. "
+            "Two modes: (1) `run` — full pipeline WITHOUT PR task-profile "
+            "(merged PR counts, profiler, eval-kit, quality score); "
+            "(2) `pr-task-profile` — ONLY the rules+LLM PR classifier, no clones. "
             "Also: resume / status / retry / check. Defaults for `run`/`check` "
             "can be set in config.yml; CLI flags override it."
         ),
@@ -2195,8 +2196,8 @@ def build_top_parser() -> argparse.ArgumentParser:
 
     run_p = sub.add_parser(
         "run",
-        help="Full pipeline (default when no subcommand is given): clones + all phases, "
-        "PR task-profile last",
+        help="Full pipeline (default): clones + all phases EXCEPT PR task-profile "
+        "(use the pr-task-profile subcommand for that)",
     )
     add_run_arguments(run_p)
 
@@ -2391,13 +2392,14 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
         ctx.manifest["repo_count"] = len(entries)
 
         # merged-pr-counts runs concurrently with the repo pool (it only reads
-        # the hosting API, not the clones). pr-task-profile is deliberately held
-        # back to run LAST, once every other folder is written: it is the
-        # longest/networkiest phase, so running it alone at the end means a
-        # failure there can never block or taint the rest of the run's output.
+        # the hosting API, not the clones). PR task-profile is Mode 2 only by
+        # default; if --no-skip-pr-task-profile is set it still runs LAST so
+        # its flakiness cannot taint earlier phase outputs.
         log.info(
             f"Per-repo phases: processing {len(entries)} repos with {ctx.workers} workers "
-            "(alongside merged-pr-counts; pr-task-profile runs last)"
+            "(alongside merged-pr-counts"
+            + ("; pr-task-profile runs last" if not ctx.skip_pr_task_profile else "")
+            + ")"
         )
         repo_results: list[dict[str, Any]] = []
         use_rich = should_use_rich(args.quiet)
@@ -2533,10 +2535,13 @@ def execute_pipeline(ctx: RunContext, args: argparse.Namespace, log: PipelineLog
             # is done and written by now, so its network/GraphQL flakiness can
             # only affect its own folder, never the rest of the run.
             if ctx.skip_pr_task_profile:
-                log.info("pr-task-profile skipped (--skip-pr-task-profile)")
+                log.info(
+                    "pr-task-profile skipped (Mode 1 default — use "
+                    "`org-analyser pr-task-profile` / `pr-task-profile` for Mode 2)"
+                )
                 ctx.manifest["phases"]["pr-task-profile"] = {
                     "skipped": True,
-                    "reason": "--skip-pr-task-profile",
+                    "reason": "mode-1-default (use pr-task-profile subcommand)",
                 }
             else:
                 if progress_ui:
